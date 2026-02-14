@@ -1,0 +1,20 @@
+[package]
+name = "conduit-setup"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Conduit node setup utility: wallet address, channel management, live console"
+
+[dependencies]
+conduit-core = { path = "../conduit-core" }
+clap = { version = "4", features = ["derive"] }
+hex = "0.4"
+ldk-node = "0.7"
+ctrlc = "3"
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tower-http = { version = "0.6", features = ["cors"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
