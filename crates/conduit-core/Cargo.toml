@@ -17,6 +17,10 @@ sha2 = "0.10"
 # Lightning
 ldk-node = "0.7"
 
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
 # Utilities
 rand = "0.8"
 hex = "0.4"
