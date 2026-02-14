@@ -41,6 +41,11 @@ use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 use tower_http::cors::CorsLayer;
+// Advertiser role
+use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
+use rusqlite::Connection;
+use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
 // Console event type
@@ -183,14 +188,31 @@ struct AppState {
     catalog: Arc<std::sync::Mutex<Vec<CatalogEntry>>>,
     storage_dir: String,
     registry_info: Option<RegistryInfo>,
+    // Advertiser role
+    advertiser_db: Option<Arc<std::sync::Mutex<Connection>>>,
+    advertiser_signing_key: Option<Arc<SigningKey>>,
+    advertiser_pubkey_hex: Option<String>,
+    ads_dir: Option<String>,
+    // Dashboard
+    dashboard_path: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
 // HTTP handlers
 // ---------------------------------------------------------------------------
 
-async fn index_handler() -> Html<&'static str> {
-    Html(CONSOLE_HTML)
+async fn index_handler(State(state): State<AppState>) -> impl IntoResponse {
+    // Serve external dashboard file if configured, otherwise fallback to embedded console
+    if let Some(ref path) = state.dashboard_path {
+        match std::fs::read_to_string(path) {
+            Ok(html) => return Html(html).into_response(),
+            Err(e) => {
+                eprintln!("Failed to read dashboard file {}: {}", path, e);
+                // Fall through to embedded console
+            }
+        }
+    }
+    Html(CONSOLE_HTML.to_string()).into_response()
 }
 
 #[derive(Serialize)]
@@ -610,6 +632,168 @@ async fn invoice_handler(
     })).into_response()
 }
 
+// ---------------------------------------------------------------------------
+// Ad-subsidized invoice (creator side)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct AdInvoiceRequest {
+    /// URL of the advertiser node (e.g. "http://104.248.57.152:3005")
+    advertiser_url: String,
+}
+
+/// POST /api/ad-invoice/{content_hash}
+///
+/// Two-payment ad-subsidized invoice flow (see docs/14_ad_attestation.md §4):
+///
+/// - **Invoice 1 (buyer_invoice):** preimage = K, amount = 1 sat.
+///   The buyer pays this to atomically learn K. K never leaves the buyer.
+///
+/// - **Invoice 2 (advertiser_invoice):** preimage = K_ad (random), amount = content price.
+///   The advertiser pays this after attestation. K_ad is meaningless.
+///
+/// The advertiser NEVER learns K. TEE-safe.
+async fn ad_invoice_handler(
+    State(state): State<AppState>,
+    AxumPath(content_hash): AxumPath<String>,
+    Json(req): Json<AdInvoiceRequest>,
+) -> impl IntoResponse {
+    // Look up catalog entry
+    let entry = {
+        let cat = state.catalog.lock().unwrap();
+        cat.iter().find(|e| e.content_hash == content_hash).cloned()
+    };
+
+    let entry = match entry {
+        Some(e) => e,
+        None => return (StatusCode::NOT_FOUND, Json(serde_json::json!({
+            "error": "Content not found in catalog"
+        }))).into_response(),
+    };
+
+    // Fetch advertiser campaign list
+    let advertiser_url = req.advertiser_url.trim_end_matches('/');
+    let campaigns_url = format!("{}/api/campaigns", advertiser_url);
+    let campaign_data = match reqwest::get(&campaigns_url).await {
+        Ok(resp) => match resp.json::<serde_json::Value>().await {
+            Ok(data) => data,
+            Err(e) => return (StatusCode::BAD_GATEWAY, Json(serde_json::json!({
+                "error": format!("Failed to parse advertiser response: {}", e)
+            }))).into_response(),
+        },
+        Err(e) => return (StatusCode::BAD_GATEWAY, Json(serde_json::json!({
+            "error": format!("Failed to reach advertiser: {}", e)
+        }))).into_response(),
+    };
+
+    // Pick the first active campaign
+    let campaigns = campaign_data["campaigns"].as_array();
+    let campaign = match campaigns.and_then(|c| c.first()) {
+        Some(c) => c.clone(),
+        None => return (StatusCode::NOT_FOUND, Json(serde_json::json!({
+            "error": "No active campaigns on advertiser"
+        }))).into_response(),
+    };
+
+    let advertiser_pubkey = campaign_data["advertiser_pubkey"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+
+    // Parse stored content key K
+    let key_bytes = hex::decode(&entry.key_hex).expect("Invalid key in catalog");
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&key_bytes);
+
+    // -----------------------------------------------------------------------
+    // Invoice 1: Buyer pays 1 sat, preimage = K (content decryption key)
+    // -----------------------------------------------------------------------
+    let buyer_bolt11 = match invoice::create_invoice_for_key(
+        &state.node, &key, 1, &format!("{} (ad-key)", entry.file_name)
+    ) {
+        Ok(b) => b,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": format!("Failed to create buyer invoice: {}", e)
+        }))).into_response(),
+    };
+    let buyer_payment_hash = hex::encode(verify::sha256_hash(&key));
+
+    // -----------------------------------------------------------------------
+    // Invoice 2: Advertiser pays content price, preimage = K_ad (random)
+    // -----------------------------------------------------------------------
+    let mut k_ad = [0u8; 32];
+    use rand::RngCore;
+    rand::thread_rng().fill_bytes(&mut k_ad);
+
+    let ad_bolt11 = match invoice::create_invoice_for_key(
+        &state.node, &k_ad, entry.price_sats, &format!("{} (ad-subsidy)", entry.file_name)
+    ) {
+        Ok(b) => b,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": format!("Failed to create advertiser invoice: {}", e)
+        }))).into_response(),
+    };
+    let ad_payment_hash = hex::encode(verify::sha256_hash(&k_ad));
+
+    let enc_filename = entry.enc_file_path.split('/').last().unwrap_or("").to_string();
+
+    // Emit SSE event
+    let tx = state.events_tx.clone();
+    emit(&tx, "creator", "AD_INVOICE_CREATED", serde_json::json!({
+        "buyer_payment_hash": &buyer_payment_hash,
+        "ad_payment_hash": &ad_payment_hash,
+        "content_hash": &entry.content_hash,
+        "buyer_amount_sats": 1,
+        "ad_amount_sats": entry.price_sats,
+        "campaign_id": campaign["campaign_id"],
+        "advertiser_url": advertiser_url,
+        "mode": "ad-subsidized-two-payment",
+    }));
+
+    // Spawn threads to wait for BOTH payments and claim them
+    {
+        let node = state.node.clone();
+        let tx2 = state.events_tx.clone();
+        let router = state.event_router.clone();
+        thread::spawn(move || {
+            handle_sell_from_catalog(&node, &tx2, &router, &key);
+        });
+    }
+    {
+        let node = state.node.clone();
+        let tx2 = state.events_tx.clone();
+        let router = state.event_router.clone();
+        thread::spawn(move || {
+            handle_sell_from_catalog(&node, &tx2, &router, &k_ad);
+        });
+    }
+
+    // Return BOTH invoices + campaign metadata
+    Json(serde_json::json!({
+        // Invoice 1: buyer pays 1 sat to learn K
+        "buyer_invoice": buyer_bolt11,
+        "buyer_payment_hash": buyer_payment_hash,
+        // Invoice 2: advertiser pays content price (preimage = K_ad, useless)
+        "advertiser_invoice": ad_bolt11,
+        "ad_payment_hash": ad_payment_hash,
+        // Content metadata
+        "content_hash": entry.content_hash,
+        "encrypted_hash": entry.encrypted_hash,
+        "price_sats": entry.price_sats,
+        "enc_filename": enc_filename,
+        "file_name": entry.file_name,
+        "size_bytes": entry.size_bytes,
+        // Ad-specific fields
+        "ad_subsidized": true,
+        "campaign_id": campaign["campaign_id"],
+        "advertiser_url": advertiser_url,
+        "advertiser_pubkey": advertiser_pubkey,
+        "ad_duration_ms": campaign["duration_ms"],
+        "ad_creative_url": format!("{}/api/campaigns/{}/creative", advertiser_url, campaign["campaign_id"].as_str().unwrap_or("")),
+        "subsidy_sats": campaign["subsidy_sats"],
+    })).into_response()
+}
+
 /// Optional body for transport-invoice: request specific chunks instead of whole file.
 #[derive(Deserialize, Default)]
 struct TransportInvoiceBody {
@@ -1025,6 +1209,503 @@ async fn wrapped_chunk_handler(
     }
 }
 
+// ===========================================================================
+// Advertiser role — third-party ad campaigns, attestation tokens, ad creative
+// serving, subsidy invoice payment. Advertisers are external parties (brands,
+// businesses, anyone) who pay to show their ads to buyers in exchange for
+// subsidizing content purchases. The creator's content is the delivery vehicle.
+// See docs/14_ad_attestation.md and docs/15_unified_dashboard.md.
+// ===========================================================================
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct AdvCampaign {
+    campaign_id: String,
+    name: String,
+    creative_file: String,
+    creative_hash: String,
+    creative_format: String,
+    duration_ms: u64,
+    subsidy_sats: u64,
+    budget_total_sats: u64,
+    budget_spent_sats: u64,
+    active: bool,
+    created_at: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct AdvStartSessionRequest {
+    buyer_pubkey: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AdvCompleteSessionRequest {
+    session_id: String,
+    buyer_pubkey: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct AdvAttestationPayload {
+    campaign_id: String,
+    buyer_pubkey: String,
+    timestamp: u64,
+    duration_ms: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct AdvPayRequest {
+    bolt11_invoice: String,
+    attestation_token: String,
+    attestation_payload: AdvAttestationPayload,
+}
+
+fn adv_init_db(conn: &Connection) {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS campaigns (
+            campaign_id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            creative_file TEXT NOT NULL,
+            creative_hash TEXT NOT NULL,
+            creative_format TEXT NOT NULL,
+            duration_ms INTEGER NOT NULL,
+            subsidy_sats INTEGER NOT NULL,
+            budget_total_sats INTEGER NOT NULL,
+            budget_spent_sats INTEGER NOT NULL DEFAULT 0,
+            active INTEGER NOT NULL DEFAULT 1,
+            created_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS sessions (
+            session_id TEXT PRIMARY KEY,
+            campaign_id TEXT NOT NULL,
+            buyer_pubkey TEXT NOT NULL,
+            started_at INTEGER NOT NULL,
+            completed INTEGER NOT NULL DEFAULT 0,
+            duration_ms INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS adv_payments (
+            payment_hash TEXT PRIMARY KEY,
+            campaign_id TEXT NOT NULL,
+            buyer_pubkey TEXT NOT NULL,
+            amount_sats INTEGER NOT NULL,
+            paid_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_sessions_campaign ON sessions(campaign_id);
+        CREATE INDEX IF NOT EXISTS idx_adv_payments_campaign ON adv_payments(campaign_id);",
+    )
+    .expect("Failed to initialize advertiser database schema");
+}
+
+fn adv_now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn adv_load_campaigns(db: &Connection) -> Vec<AdvCampaign> {
+    let mut stmt = db
+        .prepare(
+            "SELECT campaign_id, name, creative_file, creative_hash, creative_format,
+                    duration_ms, subsidy_sats, budget_total_sats, budget_spent_sats,
+                    active, created_at
+             FROM campaigns ORDER BY created_at DESC",
+        )
+        .unwrap();
+
+    stmt.query_map([], |row| {
+        Ok(AdvCampaign {
+            campaign_id: row.get(0)?,
+            name: row.get(1)?,
+            creative_file: row.get(2)?,
+            creative_hash: row.get(3)?,
+            creative_format: row.get(4)?,
+            duration_ms: row.get(5)?,
+            subsidy_sats: row.get(6)?,
+            budget_total_sats: row.get(7)?,
+            budget_spent_sats: row.get(8)?,
+            active: row.get::<_, i32>(9)? != 0,
+            created_at: row.get(10)?,
+        })
+    })
+    .unwrap()
+    .filter_map(|r| r.ok())
+    .collect()
+}
+
+fn adv_sha256_file(path: &str) -> Result<String, std::io::Error> {
+    let data = std::fs::read(path)?;
+    let mut hasher = Sha256::new();
+    hasher.update(&data);
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn adv_seed_default_campaign(db: &Connection, ads_dir: &str) {
+    let count: i64 = db
+        .query_row("SELECT COUNT(*) FROM campaigns", [], |row| row.get(0))
+        .unwrap_or(0);
+    if count > 0 {
+        return;
+    }
+    let entries: Vec<_> = match std::fs::read_dir(ads_dir) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_file())
+            .collect(),
+        Err(_) => {
+            println!("No ads directory found at '{}', skipping default campaign seed.", ads_dir);
+            return;
+        }
+    };
+    if entries.is_empty() {
+        println!("No ad creative files found in '{}'. Place a video/image file there.", ads_dir);
+        return;
+    }
+    let entry = &entries[0];
+    let file_name = entry.file_name().to_string_lossy().to_string();
+    let file_path = entry.path().to_string_lossy().to_string();
+    let creative_hash = match adv_sha256_file(&file_path) {
+        Ok(h) => h,
+        Err(e) => { eprintln!("Failed to hash {}: {}", file_path, e); return; }
+    };
+    let ext = std::path::Path::new(&file_name)
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    let creative_format = match ext.as_str() {
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        _ => "application/octet-stream",
+    };
+    let campaign_id = Uuid::new_v4().to_string();
+    db.execute(
+        "INSERT INTO campaigns
+         (campaign_id, name, creative_file, creative_hash, creative_format,
+          duration_ms, subsidy_sats, budget_total_sats, budget_spent_sats,
+          active, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, 1, ?9)",
+        rusqlite::params![
+            campaign_id, format!("Bitcoin Ad - {}", file_name), file_name,
+            creative_hash, creative_format, 15000, 50, 1_000_000, adv_now_unix(),
+        ],
+    )
+    .unwrap();
+    println!("Seeded default campaign: {} ({})", file_name, campaign_id);
+}
+
+// Attestation crypto helpers
+
+fn adv_canonical_json(payload: &AdvAttestationPayload) -> String {
+    serde_json::to_string(payload).unwrap()
+}
+
+fn adv_sign_attestation(key: &SigningKey, payload: &AdvAttestationPayload) -> String {
+    let message = adv_canonical_json(payload);
+    let signature = key.sign(message.as_bytes());
+    base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        signature.to_bytes(),
+    )
+}
+
+fn adv_verify_attestation(
+    verifying_key: &VerifyingKey,
+    payload: &AdvAttestationPayload,
+    token_b64: &str,
+) -> bool {
+    let message = adv_canonical_json(payload);
+    let sig_bytes =
+        match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, token_b64) {
+            Ok(b) => b,
+            Err(_) => return false,
+        };
+    let signature = match ed25519_dalek::Signature::from_slice(&sig_bytes) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    use ed25519_dalek::Verifier;
+    verifying_key.verify(message.as_bytes(), &signature).is_ok()
+}
+
+fn adv_load_or_create_signing_key(storage_dir: &str) -> SigningKey {
+    let key_path = format!("{}/advertiser_ed25519.key", storage_dir);
+    if let Ok(data) = std::fs::read(&key_path) {
+        if data.len() == 32 {
+            let mut bytes = [0u8; 32];
+            bytes.copy_from_slice(&data);
+            return SigningKey::from_bytes(&bytes);
+        }
+    }
+    let mut rng = rand::thread_rng();
+    let key = SigningKey::generate(&mut rng);
+    std::fs::write(&key_path, key.to_bytes()).expect("Failed to write signing key");
+    println!("Generated new Ed25519 signing key at {}", key_path);
+    key
+}
+
+// Advertiser HTTP handlers
+
+/// GET /api/campaigns -- list active campaigns
+async fn adv_list_campaigns(State(state): State<AppState>) -> impl IntoResponse {
+    let db = match &state.advertiser_db {
+        Some(db) => db,
+        None => return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error": "Advertiser role not enabled (no --ads-dir)"}))).into_response(),
+    };
+    let db = db.lock().unwrap();
+    let campaigns = adv_load_campaigns(&db);
+    let active: Vec<_> = campaigns.into_iter().filter(|c| c.active).collect();
+    let pubkey = state.advertiser_pubkey_hex.clone().unwrap_or_default();
+    Json(serde_json::json!({ "campaigns": active, "advertiser_pubkey": pubkey })).into_response()
+}
+
+/// GET /api/campaigns/{campaign_id}
+async fn adv_get_campaign(
+    State(state): State<AppState>,
+    AxumPath(campaign_id): AxumPath<String>,
+) -> impl IntoResponse {
+    let db = match &state.advertiser_db {
+        Some(db) => db,
+        None => return (StatusCode::SERVICE_UNAVAILABLE, "Advertiser role not enabled").into_response(),
+    };
+    let db = db.lock().unwrap();
+    let result = db.query_row(
+        "SELECT campaign_id, name, creative_file, creative_hash, creative_format,
+                duration_ms, subsidy_sats, budget_total_sats, budget_spent_sats,
+                active, created_at
+         FROM campaigns WHERE campaign_id = ?1",
+        rusqlite::params![campaign_id],
+        |row| {
+            Ok(AdvCampaign {
+                campaign_id: row.get(0)?,
+                name: row.get(1)?,
+                creative_file: row.get(2)?,
+                creative_hash: row.get(3)?,
+                creative_format: row.get(4)?,
+                duration_ms: row.get(5)?,
+                subsidy_sats: row.get(6)?,
+                budget_total_sats: row.get(7)?,
+                budget_spent_sats: row.get(8)?,
+                active: row.get::<_, i32>(9)? != 0,
+                created_at: row.get(10)?,
+            })
+        },
+    );
+    match result {
+        Ok(c) => Json(serde_json::json!(c)).into_response(),
+        Err(_) => (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Campaign not found"}))).into_response(),
+    }
+}
+
+/// GET /api/campaigns/{campaign_id}/creative -- serve ad creative file
+async fn adv_serve_creative(
+    State(state): State<AppState>,
+    AxumPath(campaign_id): AxumPath<String>,
+) -> impl IntoResponse {
+    let ads_dir = match &state.ads_dir {
+        Some(d) => d.clone(),
+        None => return (StatusCode::SERVICE_UNAVAILABLE, "Advertiser role not enabled").into_response(),
+    };
+    let db = state.advertiser_db.as_ref().unwrap().lock().unwrap();
+    let creative: Result<(String, String), _> = db.query_row(
+        "SELECT creative_file, creative_format FROM campaigns WHERE campaign_id = ?1 AND active = 1",
+        rusqlite::params![campaign_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    );
+    let (file_name, content_type) = match creative {
+        Ok(f) => f,
+        Err(_) => return (StatusCode::NOT_FOUND, "Campaign not found or inactive").into_response(),
+    };
+    drop(db);
+    let file_path = format!("{}/{}", ads_dir, file_name);
+    match std::fs::read(&file_path) {
+        Ok(data) => {
+            let headers = [
+                (axum::http::header::CONTENT_TYPE, content_type),
+                (axum::http::header::CONTENT_DISPOSITION, format!("inline; filename=\"{}\"", file_name)),
+            ];
+            (headers, data).into_response()
+        }
+        Err(_) => (StatusCode::NOT_FOUND, "Creative file not found on disk").into_response(),
+    }
+}
+
+/// POST /api/campaigns/{campaign_id}/start -- begin a viewing session
+async fn adv_start_session(
+    State(state): State<AppState>,
+    AxumPath(campaign_id): AxumPath<String>,
+    Json(req): Json<AdvStartSessionRequest>,
+) -> impl IntoResponse {
+    let db = match &state.advertiser_db {
+        Some(db) => db,
+        None => return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error": "Advertiser role not enabled"}))).into_response(),
+    };
+    let db = db.lock().unwrap();
+    let campaign: Result<(u64, u64, u64), _> = db.query_row(
+        "SELECT duration_ms, budget_total_sats, budget_spent_sats FROM campaigns WHERE campaign_id = ?1 AND active = 1",
+        rusqlite::params![campaign_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    );
+    let (duration_ms, budget_total, budget_spent) = match campaign {
+        Ok(c) => c,
+        Err(_) => return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Campaign not found or inactive"}))).into_response(),
+    };
+    if budget_spent >= budget_total {
+        return (StatusCode::GONE, Json(serde_json::json!({"error": "Campaign budget exhausted"}))).into_response();
+    }
+    let active_count: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM sessions WHERE campaign_id = ?1 AND buyer_pubkey = ?2 AND completed = 0 AND started_at > ?3",
+            rusqlite::params![campaign_id, req.buyer_pubkey, adv_now_unix() - 300],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    if active_count >= 5 {
+        return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({"error": "Too many active sessions"}))).into_response();
+    }
+    let session_id = Uuid::new_v4().to_string();
+    db.execute(
+        "INSERT INTO sessions (session_id, campaign_id, buyer_pubkey, started_at, completed, duration_ms) VALUES (?1, ?2, ?3, ?4, 0, ?5)",
+        rusqlite::params![session_id, campaign_id, req.buyer_pubkey, adv_now_unix(), duration_ms],
+    )
+    .unwrap();
+    println!("[advertiser] Session started: {} for campaign {} by {}", session_id, campaign_id, &req.buyer_pubkey[..8.min(req.buyer_pubkey.len())]);
+    Json(serde_json::json!({ "session_id": session_id, "duration_ms": duration_ms })).into_response()
+}
+
+/// POST /api/campaigns/{campaign_id}/complete -- complete session, return attestation token
+async fn adv_complete_session(
+    State(state): State<AppState>,
+    AxumPath(campaign_id): AxumPath<String>,
+    Json(req): Json<AdvCompleteSessionRequest>,
+) -> impl IntoResponse {
+    let db = match &state.advertiser_db {
+        Some(db) => db,
+        None => return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error": "Advertiser role not enabled"}))).into_response(),
+    };
+    let db = db.lock().unwrap();
+    let session: Result<(u64, i32, u64, String), _> = db.query_row(
+        "SELECT started_at, completed, duration_ms, buyer_pubkey FROM sessions WHERE session_id = ?1 AND campaign_id = ?2",
+        rusqlite::params![req.session_id, campaign_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    );
+    let (started_at, completed, duration_ms, stored_pubkey) = match session {
+        Ok(s) => s,
+        Err(_) => return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Session not found"}))).into_response(),
+    };
+    if stored_pubkey != req.buyer_pubkey {
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({"error": "buyer_pubkey mismatch"}))).into_response();
+    }
+    if completed != 0 {
+        return (StatusCode::CONFLICT, Json(serde_json::json!({"error": "Session already completed"}))).into_response();
+    }
+    let elapsed_ms = (adv_now_unix() - started_at) * 1000;
+    if elapsed_ms < duration_ms {
+        return (StatusCode::PRECONDITION_FAILED, Json(serde_json::json!({
+            "error": "Ad viewing not yet complete", "elapsed_ms": elapsed_ms, "required_ms": duration_ms,
+        }))).into_response();
+    }
+    db.execute("UPDATE sessions SET completed = 1 WHERE session_id = ?1", rusqlite::params![req.session_id]).unwrap();
+    let payload = AdvAttestationPayload {
+        campaign_id: campaign_id.clone(),
+        buyer_pubkey: req.buyer_pubkey.clone(),
+        timestamp: adv_now_unix(),
+        duration_ms,
+    };
+    let signing_key = state.advertiser_signing_key.as_ref().unwrap();
+    let token = adv_sign_attestation(signing_key, &payload);
+    let pubkey_hex = state.advertiser_pubkey_hex.clone().unwrap_or_default();
+    println!("[advertiser] Attestation issued: campaign={} buyer={}", campaign_id, &req.buyer_pubkey[..8.min(req.buyer_pubkey.len())]);
+    Json(serde_json::json!({ "token": token, "payload": payload, "advertiser_pubkey": pubkey_hex })).into_response()
+}
+
+/// POST /api/campaigns/{campaign_id}/pay -- validate attestation + pay invoice via LDK
+async fn adv_pay_invoice(
+    State(state): State<AppState>,
+    Json(req): Json<AdvPayRequest>,
+) -> impl IntoResponse {
+    let signing_key = match &state.advertiser_signing_key {
+        Some(k) => k.clone(),
+        None => return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"status": "advertiser_not_enabled"}))).into_response(),
+    };
+    let verifying_key = VerifyingKey::from(&*signing_key);
+    if !adv_verify_attestation(&verifying_key, &req.attestation_payload, &req.attestation_token) {
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({"status": "invalid_attestation", "payment_hash": serde_json::Value::Null}))).into_response();
+    }
+    let db = state.advertiser_db.as_ref().unwrap();
+    let db = db.lock().unwrap();
+    let campaign: Result<(u64, u64, u64), _> = db.query_row(
+        "SELECT subsidy_sats, budget_total_sats, budget_spent_sats FROM campaigns WHERE campaign_id = ?1 AND active = 1",
+        rusqlite::params![req.attestation_payload.campaign_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    );
+    let (subsidy_sats, budget_total, budget_spent) = match campaign {
+        Ok(c) => c,
+        Err(_) => return (StatusCode::NOT_FOUND, Json(serde_json::json!({"status": "campaign_not_found", "payment_hash": serde_json::Value::Null}))).into_response(),
+    };
+    if budget_spent + subsidy_sats > budget_total {
+        return (StatusCode::PAYMENT_REQUIRED, Json(serde_json::json!({"status": "budget_exhausted", "payment_hash": serde_json::Value::Null}))).into_response();
+    }
+    db.execute(
+        "UPDATE campaigns SET budget_spent_sats = budget_spent_sats + ?1 WHERE campaign_id = ?2",
+        rusqlite::params![subsidy_sats, req.attestation_payload.campaign_id],
+    )
+    .unwrap();
+    drop(db);
+
+    let invoice: ldk_node::lightning_invoice::Bolt11Invoice = match req.bolt11_invoice.parse() {
+        Ok(inv) => inv,
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"status": format!("invalid_invoice: {}", e), "payment_hash": serde_json::Value::Null}))).into_response(),
+    };
+    let hash_bytes: &[u8] = invoice.payment_hash().as_ref();
+    let payment_hash_hex = hex::encode(hash_bytes);
+
+    match state.node.bolt11_payment().send(&invoice, None) {
+        Ok(_) => {
+            println!("[advertiser] Payment sent: {} sats for campaign {} (hash: {})", subsidy_sats, req.attestation_payload.campaign_id, payment_hash_hex);
+            let db = state.advertiser_db.as_ref().unwrap().lock().unwrap();
+            let _ = db.execute(
+                "INSERT OR REPLACE INTO adv_payments (payment_hash, campaign_id, buyer_pubkey, amount_sats, paid_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![payment_hash_hex, req.attestation_payload.campaign_id, req.attestation_payload.buyer_pubkey, subsidy_sats, adv_now_unix()],
+            );
+            Json(serde_json::json!({"status": "payment_sent", "payment_hash": payment_hash_hex})).into_response()
+        }
+        Err(e) => {
+            eprintln!("[advertiser] Payment failed: {}", e);
+            let db = state.advertiser_db.as_ref().unwrap().lock().unwrap();
+            let _ = db.execute(
+                "UPDATE campaigns SET budget_spent_sats = budget_spent_sats - ?1 WHERE campaign_id = ?2",
+                rusqlite::params![subsidy_sats, req.attestation_payload.campaign_id],
+            );
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"status": format!("payment_failed: {}", e), "payment_hash": serde_json::Value::Null}))).into_response()
+        }
+    }
+}
+
+/// GET /api/advertiser/info -- advertiser-specific info
+async fn adv_info_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let pubkey = state.advertiser_pubkey_hex.clone().unwrap_or_default();
+    let enabled = state.advertiser_db.is_some();
+    let mut stats = serde_json::json!({
+        "enabled": enabled,
+        "advertiser_pubkey": pubkey,
+    });
+    if let Some(db) = &state.advertiser_db {
+        let db = db.lock().unwrap();
+        let campaigns = adv_load_campaigns(&db);
+        let total_payments: i64 = db.query_row("SELECT COUNT(*) FROM adv_payments", [], |row| row.get(0)).unwrap_or(0);
+        let total_spent: i64 = db.query_row("SELECT COALESCE(SUM(amount_sats), 0) FROM adv_payments", [], |row| row.get(0)).unwrap_or(0);
+        stats["campaign_count"] = serde_json::json!(campaigns.len());
+        stats["total_payments"] = serde_json::json!(total_payments);
+        stats["total_spent_sats"] = serde_json::json!(total_spent);
+    }
+    Json(stats)
+}
+
+// ===========================================================================
+// End of advertiser role
+// ===========================================================================
+
 fn start_http_server(port: u16, state: AppState) {
     thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
@@ -1036,6 +1717,7 @@ fn start_http_server(port: u16, state: AppState) {
                 .route("/api/catalog", get(catalog_handler))
                 .route("/api/register", post(register_api_handler))
                 .route("/api/invoice/{content_hash}", post(invoice_handler))
+                .route("/api/ad-invoice/{content_hash}", post(ad_invoice_handler))
                 .route("/api/sell", post(sell_handler))
                 .route("/api/buy", post(buy_handler))
                 .route("/api/seed", post(seed_handler))
@@ -1049,6 +1731,14 @@ fn start_http_server(port: u16, state: AppState) {
                 .route("/api/chunks/{encrypted_hash}/proof/{index}", get(chunk_proof_handler))
                 .route("/api/chunks/{encrypted_hash}/bitfield", get(chunk_bitfield_handler))
                 .route("/api/wrapped-chunks/{encrypted_hash}/{index}", get(wrapped_chunk_handler))
+                // Advertiser role routes
+                .route("/api/campaigns", get(adv_list_campaigns))
+                .route("/api/campaigns/{campaign_id}", get(adv_get_campaign))
+                .route("/api/campaigns/{campaign_id}/creative", get(adv_serve_creative))
+                .route("/api/campaigns/{campaign_id}/start", post(adv_start_session))
+                .route("/api/campaigns/{campaign_id}/complete", post(adv_complete_session))
+                .route("/api/campaigns/pay", post(adv_pay_invoice))
+                .route("/api/advertiser/info", get(adv_info_handler))
                 .layer(CorsLayer::permissive())
                 .with_state(state);
             let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port))
@@ -2530,6 +3220,15 @@ struct Cli {
     #[arg(long)]
     public_ip: Option<String>,
 
+    /// Path to directory containing ad creative files (advertiser role)
+    #[arg(long)]
+    ads_dir: Option<String>,
+
+    /// Path to dashboard HTML file (unified UI). If set, GET / serves this
+    /// file instead of the embedded console HTML.
+    #[arg(long)]
+    dashboard: Option<String>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -2689,6 +3388,33 @@ fn main() {
 
     // Start HTTP server if requested
     if let Some(http_port) = cli.http_port {
+        // Initialize advertiser role if --ads-dir is set
+        let (adv_db, adv_signing_key, adv_pubkey_hex, adv_ads_dir) = if let Some(ref ads_dir) = cli.ads_dir {
+            let ads_path = if std::path::Path::new(ads_dir).is_absolute() {
+                ads_dir.clone()
+            } else {
+                format!("{}/{}", config.storage_dir, ads_dir)
+            };
+            let _ = std::fs::create_dir_all(&ads_path);
+            let db_path = format!("{}/advertiser.db", config.storage_dir);
+            let conn = Connection::open(&db_path).expect("Failed to open advertiser database");
+            adv_init_db(&conn);
+            println!("[advertiser] Database: {}", db_path);
+            let signing_key = adv_load_or_create_signing_key(&config.storage_dir);
+            let verifying_key = VerifyingKey::from(&signing_key);
+            let pubkey_hex = hex::encode(verifying_key.to_bytes());
+            println!("[advertiser] Ed25519 pubkey: {}", pubkey_hex);
+            adv_seed_default_campaign(&conn, &ads_path);
+            (
+                Some(Arc::new(std::sync::Mutex::new(conn))),
+                Some(Arc::new(signing_key)),
+                Some(pubkey_hex),
+                Some(ads_path),
+            )
+        } else {
+            (None, None, None, None)
+        };
+
         let state = AppState {
             node: node.clone(),
             events_tx: events_tx.clone(),
@@ -2696,6 +3422,11 @@ fn main() {
             catalog: catalog.clone(),
             storage_dir: config.storage_dir.clone(),
             registry_info: registry_info.clone(),
+            advertiser_db: adv_db,
+            advertiser_signing_key: adv_signing_key,
+            advertiser_pubkey_hex: adv_pubkey_hex,
+            ads_dir: adv_ads_dir,
+            dashboard_path: cli.dashboard.clone(),
         };
         start_http_server(http_port, state);
         // Give the server a moment to bind
