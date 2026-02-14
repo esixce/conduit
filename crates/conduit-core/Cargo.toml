@@ -1,0 +1,27 @@
+[package]
+name = "conduit-core"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Core library for Conduit: atomic content-for-payment exchange"
+
+[dependencies]
+# Encryption
+aes = "0.8"
+ctr = "0.9"
+cipher = "0.4"
+
+# Hashing
+sha2 = "0.10"
+
+# Lightning
+ldk-node = "0.7"
+
+# Utilities
+rand = "0.8"
+hex = "0.4"
+thiserror = "2"
+
+[dev-dependencies]
+hex = "0.4"
+ldk-node = "0.7"
