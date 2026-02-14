@@ -256,6 +256,14 @@ async fn info_handler(State(state): State<AppState>) -> Json<NodeInfo> {
     })
 }
 
+/// GET /api/address -- on-chain wallet address (for funding)
+async fn address_handler(State(state): State<AppState>) -> impl IntoResponse {
+    match state.node.onchain_payment().new_address() {
+        Ok(addr) => Json(serde_json::json!({"address": addr.to_string()})).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
 async fn sse_handler(
     State(state): State<AppState>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<SseEvent, Infallible>>> {
@@ -1713,6 +1721,7 @@ fn start_http_server(port: u16, state: AppState) {
             let app = Router::new()
                 .route("/", get(index_handler))
                 .route("/api/info", get(info_handler))
+                .route("/api/address", get(address_handler))
                 .route("/api/events", get(sse_handler))
                 .route("/api/catalog", get(catalog_handler))
                 .route("/api/register", post(register_api_handler))
