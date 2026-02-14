@@ -1,0 +1,39 @@
+# Rust / Cargo
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Node data (LDK)
+/data/
+/ldk-data/
+*.sqlite
+*.sqlite-journal
+
+# Environment / secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Node backups (contain private keys + channel state)
+/backups/
+
+# Test artifacts
+*.mp3
+*.mp4
+*.wav
+*.flac
+*_decrypted*
+*_encrypted*
