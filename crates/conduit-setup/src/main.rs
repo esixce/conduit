@@ -281,6 +281,11 @@ struct BuyRequest {
     encrypted_file: Option<String>,      // local path (legacy)
     #[serde(default)]
     enc_url: Option<String>,             // HTTP URL to fetch .enc from creator
+    // --- Chunked buy (A5: multi-source) ---
+    #[serde(default)]
+    seeder_urls: Vec<String>,            // list of seeder HTTP base URLs
+    #[serde(default)]
+    mode: Option<String>,                // "chunked" to enable chunk-level download
 }
 
 #[derive(Deserialize)]
@@ -288,6 +293,8 @@ struct SeedRequest {
     encrypted_file: String,      // path to E on disk
     encrypted_hash: String,      // H(E) hex
     transport_price: u64,        // sats for transport
+    #[serde(default)]
+    chunks: Option<String>,      // which chunks to seed (e.g. "0,1,2,5-9"), omit for all
 }
 
 // ---------------------------------------------------------------------------
@@ -316,6 +323,8 @@ struct CatalogEntry {
     plaintext_root: String,     // Merkle root of H(plaintext chunks), hex
     #[serde(default)]
     encrypted_root: String,     // Merkle root of H(encrypted chunks), hex
+    #[serde(default)]
+    chunks_held: Vec<usize>,    // which chunk indices this node has (empty = all)
 }
 
 #[derive(Deserialize)]
@@ -370,9 +379,13 @@ async fn buy_handler(
     let node = state.node.clone();
     let tx = state.events_tx.clone();
     let router = state.event_router.clone();
+    let is_chunked = req.mode.as_deref() == Some("chunked");
     let is_two_phase = req.transport_invoice.is_some() && req.content_invoice.is_some();
     thread::spawn(move || {
-        if is_two_phase {
+        if is_chunked {
+            // --- Chunked buy: multi-source chunk download (A5) ---
+            handle_buy_chunked(&node, &tx, &router, &req);
+        } else if is_two_phase {
             // --- Two-phase buy: seeder + creator ---
             handle_buy_two_phase(&node, &tx, &router, &req);
         } else {
@@ -441,7 +454,7 @@ async fn seed_handler(
     let storage_dir = state.storage_dir.clone();
     let registry_info = state.registry_info.clone();
     thread::spawn(move || {
-        handle_seed(&tx, &storage_dir, &catalog, &req.encrypted_file, &req.encrypted_hash, req.transport_price, &registry_info);
+        handle_seed(&tx, &storage_dir, &catalog, &req.encrypted_file, &req.encrypted_hash, req.transport_price, &registry_info, &req.chunks);
     });
     Json(serde_json::json!({"status": "started"}))
 }
@@ -597,10 +610,20 @@ async fn invoice_handler(
     })).into_response()
 }
 
+/// Optional body for transport-invoice: request specific chunks instead of whole file.
+#[derive(Deserialize, Default)]
+struct TransportInvoiceBody {
+    #[serde(default)]
+    chunks: Vec<usize>,   // empty = legacy whole-file wrapping
+}
+
 async fn transport_invoice_handler(
     State(state): State<AppState>,
     AxumPath(encrypted_hash): AxumPath<String>,
+    body: Option<Json<TransportInvoiceBody>>,
 ) -> impl IntoResponse {
+    let requested_chunks = body.map(|b| b.0.chunks).unwrap_or_default();
+
     // Look up catalog entry by encrypted_hash
     let entry = {
         let cat = state.catalog.lock().unwrap();
@@ -625,54 +648,126 @@ async fn transport_invoice_handler(
     // Generate fresh transport key K_S
     let ks = encrypt::generate_key();
 
-    // Wrap: W = Enc(E, K_S)
-    let wrapped = encrypt::encrypt(&encrypted, &ks, 0);
-    let wrapped_path = format!("{}.wrapped", entry.enc_file_path);
-    let wrapped_filename = wrapped_path.split('/').last().unwrap_or("").to_string();
-    if let Err(e) = std::fs::write(&wrapped_path, &wrapped) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-            "error": format!("Failed to write wrapped file: {}", e)
-        }))).into_response();
+    if requested_chunks.is_empty() {
+        // --- Legacy mode: wrap entire file as one blob ---
+        let wrapped = encrypt::encrypt(&encrypted, &ks, 0);
+        let wrapped_path = format!("{}.wrapped", entry.enc_file_path);
+        let wrapped_filename = wrapped_path.split('/').last().unwrap_or("").to_string();
+        if let Err(e) = std::fs::write(&wrapped_path, &wrapped) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                "error": format!("Failed to write wrapped file: {}", e)
+            }))).into_response();
+        }
+
+        let bolt11 = match invoice::create_invoice_for_key(
+            &state.node, &ks, entry.transport_price, "transport"
+        ) {
+            Ok(b) => b,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                "error": format!("Failed to create invoice: {}", e)
+            }))).into_response(),
+        };
+
+        let payment_hash = hex::encode(verify::sha256_hash(&ks));
+
+        let tx = state.events_tx.clone();
+        emit(&tx, "seeder", "TRANSPORT_INVOICE_CREATED", serde_json::json!({
+            "payment_hash": &payment_hash,
+            "amount_sats": entry.transport_price,
+            "bolt11": &bolt11,
+            "wrapped_filename": &wrapped_filename,
+            "encrypted_hash": &encrypted_hash,
+        }));
+
+        let node = state.node.clone();
+        let tx2 = state.events_tx.clone();
+        let router = state.event_router.clone();
+        thread::spawn(move || {
+            handle_transport_payment(&node, &tx2, &router, &ks);
+        });
+
+        Json(serde_json::json!({
+            "bolt11": bolt11,
+            "payment_hash": payment_hash,
+            "encrypted_hash": encrypted_hash,
+            "transport_price": entry.transport_price,
+            "wrapped_filename": wrapped_filename,
+            "mode": "whole_file",
+        })).into_response()
+    } else {
+        // --- Chunked mode: wrap each requested chunk individually with K_S ---
+        let cs = if entry.chunk_size > 0 { entry.chunk_size } else { chunk::select_chunk_size(encrypted.len()) };
+        let (enc_chunks, _meta) = chunk::split(&encrypted, cs);
+        let total_chunks = enc_chunks.len();
+
+        // Validate requested chunks
+        for &idx in &requested_chunks {
+            if idx >= total_chunks {
+                return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                    "error": format!("Chunk index {} out of range (total: {})", idx, total_chunks)
+                }))).into_response();
+            }
+            // Check if seeder holds this chunk
+            if !entry.chunks_held.is_empty() && !entry.chunks_held.contains(&idx) {
+                return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                    "error": format!("Seeder does not hold chunk {}", idx)
+                }))).into_response();
+            }
+        }
+
+        // Wrap each requested chunk: W_i = Enc(E_i, K_S, chunk_index=i)
+        let wrap_dir = format!("{}.wrapped_chunks", entry.enc_file_path);
+        let _ = std::fs::create_dir_all(&wrap_dir);
+        let mut wrapped_files = Vec::new();
+        for &idx in &requested_chunks {
+            let wrapped_chunk = encrypt::encrypt(&enc_chunks[idx], &ks, idx as u64);
+            let chunk_path = format!("{}/{}", wrap_dir, idx);
+            if let Err(e) = std::fs::write(&chunk_path, &wrapped_chunk) {
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                    "error": format!("Failed to write wrapped chunk {}: {}", idx, e)
+                }))).into_response();
+            }
+            wrapped_files.push(idx);
+        }
+
+        let bolt11 = match invoice::create_invoice_for_key(
+            &state.node, &ks, entry.transport_price, "transport"
+        ) {
+            Ok(b) => b,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                "error": format!("Failed to create invoice: {}", e)
+            }))).into_response(),
+        };
+
+        let payment_hash = hex::encode(verify::sha256_hash(&ks));
+
+        let tx = state.events_tx.clone();
+        emit(&tx, "seeder", "TRANSPORT_INVOICE_CREATED", serde_json::json!({
+            "payment_hash": &payment_hash,
+            "amount_sats": entry.transport_price,
+            "bolt11": &bolt11,
+            "chunks": &requested_chunks,
+            "encrypted_hash": &encrypted_hash,
+            "mode": "chunked",
+        }));
+
+        let node = state.node.clone();
+        let tx2 = state.events_tx.clone();
+        let router = state.event_router.clone();
+        thread::spawn(move || {
+            handle_transport_payment(&node, &tx2, &router, &ks);
+        });
+
+        Json(serde_json::json!({
+            "bolt11": bolt11,
+            "payment_hash": payment_hash,
+            "encrypted_hash": encrypted_hash,
+            "transport_price": entry.transport_price,
+            "chunks": wrapped_files,
+            "wrap_dir": wrap_dir.split('/').last().unwrap_or(""),
+            "mode": "chunked",
+        })).into_response()
     }
-
-    // Create transport invoice (preimage = K_S)
-    let bolt11 = match invoice::create_invoice_for_key(
-        &state.node, &ks, entry.transport_price, "transport"
-    ) {
-        Ok(b) => b,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-            "error": format!("Failed to create invoice: {}", e)
-        }))).into_response(),
-    };
-
-    let payment_hash = hex::encode(verify::sha256_hash(&ks));
-
-    // Emit SSE event
-    let tx = state.events_tx.clone();
-    emit(&tx, "seeder", "TRANSPORT_INVOICE_CREATED", serde_json::json!({
-        "payment_hash": &payment_hash,
-        "amount_sats": entry.transport_price,
-        "bolt11": &bolt11,
-        "wrapped_filename": &wrapped_filename,
-        "encrypted_hash": &encrypted_hash,
-    }));
-
-    // Spawn thread to wait for payment and claim it
-    let node = state.node.clone();
-    let tx2 = state.events_tx.clone();
-    let router = state.event_router.clone();
-    thread::spawn(move || {
-        handle_transport_payment(&node, &tx2, &router, &ks);
-    });
-
-    // Return invoice data
-    Json(serde_json::json!({
-        "bolt11": bolt11,
-        "payment_hash": payment_hash,
-        "encrypted_hash": encrypted_hash,
-        "transport_price": entry.transport_price,
-        "wrapped_filename": wrapped_filename,
-    })).into_response()
 }
 
 /// Wait for a transport payment and claim it (reveals K_S to buyer).
@@ -762,6 +857,174 @@ async fn decrypted_file_handler(
     }
 }
 
+// ---------------------------------------------------------------------------
+// A4: Chunk-level HTTP endpoints
+// ---------------------------------------------------------------------------
+
+/// Helper: find a catalog entry by encrypted_hash and return it with chunk metadata.
+fn find_entry_with_chunks(
+    state: &AppState,
+    encrypted_hash: &str,
+) -> Option<(CatalogEntry, Vec<Vec<u8>>, usize)> {
+    let entry = {
+        let cat = state.catalog.lock().unwrap();
+        cat.iter().find(|e| e.encrypted_hash == encrypted_hash).cloned()
+    };
+    let entry = entry?;
+
+    let encrypted = std::fs::read(&entry.enc_file_path).ok()?;
+    let cs = if entry.chunk_size > 0 { entry.chunk_size } else { chunk::select_chunk_size(encrypted.len()) };
+    let (enc_chunks, _meta) = chunk::split(&encrypted, cs);
+    Some((entry, enc_chunks, cs))
+}
+
+/// GET /api/chunks/{encrypted_hash}/meta
+/// Returns chunk count, chunk size, Merkle roots, file size.
+async fn chunk_meta_handler(
+    State(state): State<AppState>,
+    AxumPath(encrypted_hash): AxumPath<String>,
+) -> impl IntoResponse {
+    let entry = {
+        let cat = state.catalog.lock().unwrap();
+        cat.iter().find(|e| e.encrypted_hash == encrypted_hash).cloned()
+    };
+    match entry {
+        Some(e) => Json(serde_json::json!({
+            "encrypted_hash": e.encrypted_hash,
+            "chunk_count": e.chunk_count,
+            "chunk_size": e.chunk_size,
+            "size_bytes": e.size_bytes,
+            "encrypted_root": e.encrypted_root,
+            "plaintext_root": e.plaintext_root,
+            "content_hash": e.content_hash,
+        })).into_response(),
+        None => (StatusCode::NOT_FOUND, "content not found").into_response(),
+    }
+}
+
+/// GET /api/chunks/{encrypted_hash}/{index}
+/// Serves a single encrypted chunk E_i by reading the .enc file and slicing.
+async fn chunk_data_handler(
+    State(state): State<AppState>,
+    AxumPath((encrypted_hash, index)): AxumPath<(String, usize)>,
+) -> impl IntoResponse {
+    let result = find_entry_with_chunks(&state, &encrypted_hash);
+    match result {
+        Some((entry, enc_chunks, _cs)) => {
+            // Check if seeder has this chunk
+            if !entry.chunks_held.is_empty() && !entry.chunks_held.contains(&index) {
+                return (StatusCode::NOT_FOUND, "seeder does not hold this chunk").into_response();
+            }
+            if index >= enc_chunks.len() {
+                return (StatusCode::NOT_FOUND, "chunk index out of range").into_response();
+            }
+            (
+                StatusCode::OK,
+                [
+                    ("content-type", "application/octet-stream"),
+                    ("x-chunk-index", &index.to_string()),
+                    ("x-chunk-count", &enc_chunks.len().to_string()),
+                ],
+                enc_chunks[index].clone(),
+            ).into_response()
+        }
+        None => (StatusCode::NOT_FOUND, "content not found").into_response(),
+    }
+}
+
+/// GET /api/chunks/{encrypted_hash}/proof/{index}
+/// Returns a Merkle inclusion proof for chunk i against the encrypted Merkle root.
+async fn chunk_proof_handler(
+    State(state): State<AppState>,
+    AxumPath((encrypted_hash, index)): AxumPath<(String, usize)>,
+) -> impl IntoResponse {
+    let result = find_entry_with_chunks(&state, &encrypted_hash);
+    match result {
+        Some((entry, enc_chunks, _cs)) => {
+            if index >= enc_chunks.len() {
+                return (StatusCode::NOT_FOUND, Json(serde_json::json!({
+                    "error": "chunk index out of range"
+                }))).into_response();
+            }
+            let tree = MerkleTree::from_chunks(&enc_chunks);
+            let proof = tree.proof(index);
+            let leaf_hash = hex::encode(tree.leaf_hash_at(index));
+            Json(serde_json::json!({
+                "index": index,
+                "leaf_hash": leaf_hash,
+                "proof": proof.to_json(),
+                "encrypted_root": entry.encrypted_root,
+            })).into_response()
+        }
+        None => (StatusCode::NOT_FOUND, Json(serde_json::json!({
+            "error": "content not found"
+        }))).into_response(),
+    }
+}
+
+/// GET /api/chunks/{encrypted_hash}/bitfield
+/// Returns which chunks this node has. Empty chunks_held means "all".
+async fn chunk_bitfield_handler(
+    State(state): State<AppState>,
+    AxumPath(encrypted_hash): AxumPath<String>,
+) -> impl IntoResponse {
+    let entry = {
+        let cat = state.catalog.lock().unwrap();
+        cat.iter().find(|e| e.encrypted_hash == encrypted_hash).cloned()
+    };
+    match entry {
+        Some(e) => {
+            let total = if e.chunk_count > 0 { e.chunk_count } else { 1 };
+            let bitfield: Vec<bool> = if e.chunks_held.is_empty() {
+                // Empty = has all chunks
+                vec![true; total]
+            } else {
+                (0..total).map(|i| e.chunks_held.contains(&i)).collect()
+            };
+            Json(serde_json::json!({
+                "encrypted_hash": e.encrypted_hash,
+                "chunk_count": total,
+                "bitfield": bitfield,
+                "chunks_held": if e.chunks_held.is_empty() {
+                    (0..total).collect::<Vec<usize>>()
+                } else {
+                    e.chunks_held.clone()
+                },
+            })).into_response()
+        }
+        None => (StatusCode::NOT_FOUND, "content not found").into_response(),
+    }
+}
+
+/// GET /api/wrapped-chunks/{encrypted_hash}/{index}
+/// Serves a previously wrapped chunk W_i from the wrapped_chunks directory.
+async fn wrapped_chunk_handler(
+    State(state): State<AppState>,
+    AxumPath((encrypted_hash, index)): AxumPath<(String, usize)>,
+) -> impl IntoResponse {
+    let entry = {
+        let cat = state.catalog.lock().unwrap();
+        cat.iter().find(|e| e.encrypted_hash == encrypted_hash).cloned()
+    };
+    let entry = match entry {
+        Some(e) => e,
+        None => return (StatusCode::NOT_FOUND, "content not found").into_response(),
+    };
+
+    let chunk_path = format!("{}.wrapped_chunks/{}", entry.enc_file_path, index);
+    match std::fs::read(&chunk_path) {
+        Ok(data) => (
+            StatusCode::OK,
+            [
+                ("content-type", "application/octet-stream"),
+                ("x-chunk-index", &index.to_string()),
+            ],
+            data,
+        ).into_response(),
+        Err(_) => (StatusCode::NOT_FOUND, "wrapped chunk not found (request transport-invoice first)").into_response(),
+    }
+}
+
 fn start_http_server(port: u16, state: AppState) {
     thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
@@ -780,6 +1043,12 @@ fn start_http_server(port: u16, state: AppState) {
                 .route("/api/enc/{filename}", get(enc_file_handler))
                 .route("/api/wrapped/{filename}", get(wrapped_file_handler))
                 .route("/api/decrypted/{filename}", get(decrypted_file_handler))
+                // A4: Chunk-level endpoints
+                .route("/api/chunks/{encrypted_hash}/meta", get(chunk_meta_handler))
+                .route("/api/chunks/{encrypted_hash}/{index}", get(chunk_data_handler))
+                .route("/api/chunks/{encrypted_hash}/proof/{index}", get(chunk_proof_handler))
+                .route("/api/chunks/{encrypted_hash}/bitfield", get(chunk_bitfield_handler))
+                .route("/api/wrapped-chunks/{encrypted_hash}/{index}", get(wrapped_chunk_handler))
                 .layer(CorsLayer::permissive())
                 .with_state(state);
             let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port))
@@ -904,6 +1173,40 @@ fn handle_sell(node: &Arc<Node>, tx: &broadcast::Sender<ConsoleEvent>, router: &
 }
 
 // ---------------------------------------------------------------------------
+// Parse --chunks argument: "0,1,2,5-9" -> vec![0,1,2,5,6,7,8,9]
+// Returns empty vec if arg is None (meaning "all chunks").
+// ---------------------------------------------------------------------------
+
+fn parse_chunks_arg(arg: &Option<String>, total_chunks: usize) -> Vec<usize> {
+    let arg = match arg {
+        Some(s) if !s.is_empty() => s,
+        _ => return Vec::new(), // empty = all chunks
+    };
+
+    let mut result = Vec::new();
+    for part in arg.split(',') {
+        let part = part.trim();
+        if let Some((start_str, end_str)) = part.split_once('-') {
+            let start: usize = start_str.trim().parse().expect("Invalid chunk range start");
+            let end: usize = end_str.trim().parse().expect("Invalid chunk range end");
+            for i in start..=end {
+                if i < total_chunks {
+                    result.push(i);
+                }
+            }
+        } else {
+            let idx: usize = part.parse().expect("Invalid chunk index");
+            if idx < total_chunks {
+                result.push(idx);
+            }
+        }
+    }
+    result.sort();
+    result.dedup();
+    result
+}
+
+// ---------------------------------------------------------------------------
 // seed command (seeder: wrap with transport key K_S)
 // ---------------------------------------------------------------------------
 
@@ -915,6 +1218,7 @@ fn handle_seed(
     expected_enc_hash_hex: &str,
     transport_price: u64,
     registry_info: &Option<RegistryInfo>,
+    chunks_arg: &Option<String>,
 ) {
     let role = "seeder";
 
@@ -954,6 +1258,21 @@ fn handle_seed(
     let enc_filename = enc_file_path.split('/').last().unwrap_or("unknown.enc");
     let file_name = enc_filename.strip_suffix(".enc").unwrap_or(enc_filename).to_string();
 
+    // 4b. Compute chunk metadata from the encrypted file
+    let cs = chunk::select_chunk_size(encrypted.len());
+    let (enc_chunks, meta) = chunk::split(&encrypted, cs);
+    let enc_tree = MerkleTree::from_chunks(&enc_chunks);
+
+    // 4c. Parse --chunks argument (e.g. "0,1,2,5-9")
+    let chunks_held = parse_chunks_arg(chunks_arg, meta.count);
+    if !chunks_held.is_empty() {
+        emit(tx, role, "CHUNKS_SELECTED", serde_json::json!({
+            "chunks_held": &chunks_held,
+            "total_chunks": meta.count,
+            "message": format!("Seeding {} of {} chunks", chunks_held.len(), meta.count),
+        }));
+    }
+
     // 5. Save to catalog
     let registered_at = {
         let secs = SystemTime::now()
@@ -974,11 +1293,11 @@ fn handle_seed(
         size_bytes: encrypted.len() as u64,
         registered_at: registered_at.clone(),
         transport_price,
-        // Seeder doesn't compute these -- will be fetched from creator catalog
-        chunk_size: 0,
-        chunk_count: 0,
-        plaintext_root: String::new(),
-        encrypted_root: String::new(),
+        chunk_size: meta.chunk_size,
+        chunk_count: meta.count,
+        plaintext_root: String::new(),  // seeder doesn't know plaintext root
+        encrypted_root: hex::encode(enc_tree.root()),
+        chunks_held: chunks_held.clone(),
     };
 
     {
@@ -987,15 +1306,20 @@ fn handle_seed(
         save_catalog(storage_dir, &cat);
     }
 
+    let chunks_seeding = if chunks_held.is_empty() { meta.count } else { chunks_held.len() };
     emit(tx, role, "CONTENT_SEEDED", serde_json::json!({
         "encrypted_hash": expected_enc_hash_hex,
         "file_name": &file_name,
         "transport_price": transport_price,
         "size_bytes": encrypted.len(),
-        "message": "Content added to seeder catalog. Transport invoices generated on demand.",
+        "chunk_count": meta.count,
+        "chunk_size": meta.chunk_size,
+        "chunks_seeding": chunks_seeding,
+        "encrypted_root": hex::encode(enc_tree.root()),
+        "message": format!("Content added to seeder catalog ({}/{} chunks). Transport invoices generated on demand.", chunks_seeding, meta.count),
     }));
 
-    // Push seeder announcement to registry (fire-and-forget)
+    // Push seeder announcement to registry (blocking)
     if let Some(ref info) = registry_info {
         let body = serde_json::json!({
             "encrypted_hash": expected_enc_hash_hex,
@@ -1003,17 +1327,15 @@ fn handle_seed(
             "seeder_address": &info.http_address,
             "seeder_ln_address": &info.ln_address,
             "transport_price": transport_price,
-            "chunk_count": 0,
+            "chunk_count": meta.count,
+            "chunks_held": &chunks_held,
             "announced_at": &registered_at,
         });
         let url = format!("{}/api/seeders", info.url);
-        let _ = tokio::runtime::Handle::current().spawn(async move {
-            let client = reqwest::Client::new();
-            match client.post(&url).json(&body).send().await {
-                Ok(resp) => println!("Registry: seeder announced ({})", resp.status()),
-                Err(e) => eprintln!("Warning: failed to push seeder to registry: {}", e),
-            }
-        });
+        match reqwest::blocking::Client::new().post(&url).json(&body).send() {
+            Ok(resp) => println!("Registry: seeder announced ({})", resp.status()),
+            Err(e) => eprintln!("Warning: failed to push seeder to registry: {}", e),
+        }
     }
 }
 
@@ -1122,6 +1444,7 @@ fn handle_register(
         chunk_count: meta.count,
         plaintext_root: hex::encode(plain_tree.root()),
         encrypted_root: hex::encode(enc_tree.root()),
+        chunks_held: Vec::new(),  // empty = creator has all chunks
     };
 
     {
@@ -1157,7 +1480,7 @@ fn handle_register(
     println!("Catalog:        {}", catalog_path(storage_dir));
     println!();
 
-    // Push listing to registry (fire-and-forget)
+    // Push listing to registry (blocking)
     if let Some(ref info) = registry_info {
         let body = serde_json::json!({
             "content_hash": &content_hash,
@@ -1175,13 +1498,10 @@ fn handle_register(
             "registered_at": &registered_at,
         });
         let url = format!("{}/api/listings", info.url);
-        let _ = tokio::runtime::Handle::current().spawn(async move {
-            let client = reqwest::Client::new();
-            match client.post(&url).json(&body).send().await {
-                Ok(resp) => println!("Registry: listing pushed ({})", resp.status()),
-                Err(e) => eprintln!("Warning: failed to push listing to registry: {}", e),
-            }
-        });
+        match reqwest::blocking::Client::new().post(&url).json(&body).send() {
+            Ok(resp) => println!("Registry: listing pushed ({})", resp.status()),
+            Err(e) => eprintln!("Warning: failed to push listing to registry: {}", e),
+        }
     }
 }
 
@@ -1489,11 +1809,19 @@ fn handle_buy_two_phase(
         }
     }
 
-    // 7. Decrypt: F = Dec(E, K) — using the key we already got from the creator
-    let plaintext = encrypt::decrypt(&encrypted, &key, 0);
+    // 7. Decrypt per-chunk: F_i = Dec(E_i, K, i) for each chunk, then reassemble
+    //    The .enc file is E_0 || E_1 || ... || E_N where E_i = Enc(F_i, K, i)
+    let cs = chunk::select_chunk_size(encrypted.len());
+    let (enc_chunks, _meta) = chunk::split(&encrypted, cs);
+    let plaintext: Vec<u8> = enc_chunks
+        .iter()
+        .enumerate()
+        .flat_map(|(i, c)| encrypt::decrypt(c, &key, i as u64))
+        .collect();
     emit(tx, role, "CONTENT_DECRYPTED", serde_json::json!({
         "bytes": plaintext.len(),
         "key": hex::encode(key),
+        "chunks": enc_chunks.len(),
     }));
 
     // 8. Verify H(F)
@@ -1525,6 +1853,504 @@ fn handle_buy_two_phase(
     println!();
     println!("=== BUY COMPLETE (two-phase) ===");
     println!("Decrypted file: {} ({} bytes)", req.output, plaintext.len());
+    println!("SHA-256 verified: content is authentic.");
+}
+
+// ---------------------------------------------------------------------------
+// A5: Chunked buy — fetch chunks from multiple seeders, verify, reassemble
+// ---------------------------------------------------------------------------
+
+fn handle_buy_chunked(
+    node: &Arc<Node>,
+    tx: &broadcast::Sender<ConsoleEvent>,
+    router: &Arc<EventRouter>,
+    req: &BuyRequest,
+) {
+    let role = "buyer";
+    let content_invoice = match req.content_invoice.as_deref() {
+        Some(inv) => inv,
+        None => {
+            emit(tx, role, "BUY_ERROR", serde_json::json!({
+                "message": "Chunked buy requires content_invoice",
+            }));
+            return;
+        }
+    };
+    let enc_hash_hex = match req.encrypted_hash.as_deref() {
+        Some(h) => h.to_string(),
+        None => {
+            emit(tx, role, "BUY_ERROR", serde_json::json!({
+                "message": "Chunked buy requires encrypted_hash",
+            }));
+            return;
+        }
+    };
+    if req.seeder_urls.is_empty() {
+        emit(tx, role, "BUY_ERROR", serde_json::json!({
+            "message": "Chunked buy requires at least one seeder_url",
+        }));
+        return;
+    }
+
+    // -----------------------------------------------------------------------
+    // PHASE 1: Pay creator for content key K (same as two-phase)
+    // -----------------------------------------------------------------------
+
+    for i in (1..=3).rev() {
+        emit(tx, role, "COUNTDOWN", serde_json::json!({
+            "seconds": i,
+            "message": format!("Paying creator in {}...", i),
+        }));
+        thread::sleep(Duration::from_secs(1));
+    }
+
+    let content_payment_hash = {
+        use ldk_node::lightning_invoice::Bolt11Invoice;
+        let inv: Bolt11Invoice = content_invoice.parse().expect("Invalid content invoice");
+        let h: &[u8] = inv.payment_hash().as_ref();
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(h);
+        arr
+    };
+
+    emit(tx, role, "CONTENT_PAYING", serde_json::json!({
+        "bolt11": content_invoice,
+        "message": "Paying creator for content key K...",
+    }));
+
+    let key: [u8; 32];
+    match invoice::pay_invoice(node, content_invoice) {
+        Ok(hash_bytes_k) => {
+            let target_hash_k = PaymentHash(hash_bytes_k);
+            emit(tx, role, "CONTENT_PAYMENT_SENT", serde_json::json!({
+                "payment_hash": hex::encode(hash_bytes_k),
+            }));
+            let rx = router.register(target_hash_k);
+            loop {
+                let event = rx.recv().expect("Event router dropped");
+                match event {
+                    Event::PaymentSuccessful {
+                        payment_preimage: Some(preimage),
+                        fee_paid_msat,
+                        ..
+                    } => {
+                        key = preimage.0;
+                        emit(tx, role, "CONTENT_PAID", serde_json::json!({
+                            "preimage_k": hex::encode(key),
+                            "fee_msat": fee_paid_msat,
+                            "message": "Content key K received!",
+                        }));
+                        break;
+                    }
+                    Event::PaymentFailed { reason, .. } => {
+                        emit(tx, role, "CONTENT_PAYMENT_FAILED", serde_json::json!({
+                            "reason": format!("{:?}", reason),
+                            "message": "Content payment failed.",
+                        }));
+                        router.unregister(&target_hash_k);
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+            router.unregister(&target_hash_k);
+        }
+        Err(e) => {
+            let err_str = format!("{:?}", e);
+            if err_str.contains("DuplicatePayment") {
+                emit(tx, role, "CONTENT_ALREADY_PAID", serde_json::json!({
+                    "message": "Already paid for content key K. Looking up from payment history...",
+                }));
+                let target = PaymentHash(content_payment_hash);
+                let payments = node.list_payments_with_filter(|p| {
+                    p.direction == PaymentDirection::Outbound
+                        && p.status == PaymentStatus::Succeeded
+                });
+                let found = payments.iter().find(|p| {
+                    if let PaymentKind::Bolt11 { hash, preimage: Some(_), .. } = &p.kind {
+                        *hash == target
+                    } else {
+                        false
+                    }
+                });
+                match found {
+                    Some(p) => {
+                        if let PaymentKind::Bolt11 { preimage: Some(pre), .. } = &p.kind {
+                            key = pre.0;
+                            emit(tx, role, "CONTENT_PAID", serde_json::json!({
+                                "preimage_k": hex::encode(key),
+                                "message": "Recovered K from payment history.",
+                            }));
+                        } else {
+                            emit(tx, role, "CONTENT_PAYMENT_FAILED", serde_json::json!({
+                                "message": "Found payment but no preimage.",
+                            }));
+                            return;
+                        }
+                    }
+                    None => {
+                        emit(tx, role, "CONTENT_PAYMENT_FAILED", serde_json::json!({
+                            "message": "DuplicatePayment but preimage not found in history.",
+                        }));
+                        return;
+                    }
+                }
+            } else {
+                emit(tx, role, "CONTENT_PAYMENT_FAILED", serde_json::json!({
+                    "error": err_str,
+                    "message": "Content payment failed.",
+                }));
+                return;
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // PHASE 2: Fetch chunk metadata from first seeder
+    // -----------------------------------------------------------------------
+
+    let client = reqwest::blocking::Client::new();
+    let meta_url = format!("{}/api/chunks/{}/meta", &req.seeder_urls[0], &enc_hash_hex);
+    let meta: serde_json::Value = match client.get(&meta_url).send().and_then(|r| r.json()) {
+        Ok(m) => m,
+        Err(e) => {
+            emit(tx, role, "BUY_ERROR", serde_json::json!({
+                "message": format!("Failed to fetch chunk metadata: {}", e),
+            }));
+            return;
+        }
+    };
+
+    let chunk_count = meta["chunk_count"].as_u64().unwrap_or(0) as usize;
+    let chunk_size = meta["chunk_size"].as_u64().unwrap_or(0) as usize;
+    let encrypted_root = meta["encrypted_root"].as_str().unwrap_or("").to_string();
+
+    emit(tx, role, "CHUNK_META_RECEIVED", serde_json::json!({
+        "chunk_count": chunk_count,
+        "chunk_size": chunk_size,
+        "encrypted_root": &encrypted_root,
+        "seeders": req.seeder_urls.len(),
+    }));
+
+    if chunk_count == 0 {
+        emit(tx, role, "BUY_ERROR", serde_json::json!({
+            "message": "chunk_count is 0 — content has no chunks",
+        }));
+        return;
+    }
+
+    // -----------------------------------------------------------------------
+    // PHASE 3: Fetch bitfields from all seeders, build assignment plan
+    // -----------------------------------------------------------------------
+
+    // Collect bitfields: seeder_index -> Vec<bool>
+    let mut seeder_bitfields: Vec<Vec<bool>> = Vec::new();
+    for (_si, url) in req.seeder_urls.iter().enumerate() {
+        let bf_url = format!("{}/api/chunks/{}/bitfield", url, &enc_hash_hex);
+        match client.get(&bf_url).send().and_then(|r| r.json::<serde_json::Value>()) {
+            Ok(bf) => {
+                let bits: Vec<bool> = bf["bitfield"]
+                    .as_array()
+                    .map(|arr| arr.iter().map(|v| v.as_bool().unwrap_or(false)).collect())
+                    .unwrap_or_default();
+                emit(tx, role, "BITFIELD_RECEIVED", serde_json::json!({
+                    "seeder": url,
+                    "chunks_available": bits.iter().filter(|&&b| b).count(),
+                    "total": chunk_count,
+                }));
+                seeder_bitfields.push(bits);
+            }
+            Err(e) => {
+                emit(tx, role, "BITFIELD_FAILED", serde_json::json!({
+                    "seeder": url,
+                    "error": format!("{}", e),
+                }));
+                seeder_bitfields.push(vec![false; chunk_count]);
+            }
+        }
+    }
+
+    // Assign each chunk to a seeder (round-robin among seeders that have it)
+    let mut assignments: Vec<Option<usize>> = vec![None; chunk_count];
+    for chunk_idx in 0..chunk_count {
+        // Find seeders that have this chunk
+        let available: Vec<usize> = (0..req.seeder_urls.len())
+            .filter(|&si| seeder_bitfields[si].get(chunk_idx).copied().unwrap_or(false))
+            .collect();
+        if available.is_empty() {
+            emit(tx, role, "BUY_ERROR", serde_json::json!({
+                "message": format!("No seeder has chunk {}!", chunk_idx),
+                "chunk_index": chunk_idx,
+            }));
+            return;
+        }
+        // Round-robin: assign to seeder with fewest assignments so far
+        let best = available.iter()
+            .min_by_key(|&&si| assignments.iter().filter(|a| **a == Some(si)).count())
+            .unwrap();
+        assignments[chunk_idx] = Some(*best);
+    }
+
+    emit(tx, role, "CHUNK_PLAN", serde_json::json!({
+        "assignments": assignments.iter().map(|a| a.unwrap_or(0)).collect::<Vec<_>>(),
+        "message": format!("Chunk download plan ready: {} chunks across {} seeders", chunk_count, req.seeder_urls.len()),
+    }));
+
+    // -----------------------------------------------------------------------
+    // PHASE 4: Request transport invoices from each seeder (batched per seeder)
+    // -----------------------------------------------------------------------
+
+    // Group chunks by seeder
+    let mut seeder_chunks: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
+    for (ci, assignment) in assignments.iter().enumerate() {
+        if let Some(si) = assignment {
+            seeder_chunks.entry(*si).or_default().push(ci);
+        }
+    }
+
+    // For each seeder, request a transport invoice for its chunks
+    struct SeederTransport {
+        seeder_index: usize,
+        chunks: Vec<usize>,
+        bolt11: String,
+        ks: Option<[u8; 32]>,
+    }
+
+    let mut transports: Vec<SeederTransport> = Vec::new();
+
+    for (&si, chunks) in &seeder_chunks {
+        let url = format!("{}/api/transport-invoice/{}", &req.seeder_urls[si], &enc_hash_hex);
+        let body = serde_json::json!({ "chunks": chunks });
+        match client.post(&url).json(&body).send().and_then(|r| r.json::<serde_json::Value>()) {
+            Ok(resp) => {
+                let bolt11 = resp["bolt11"].as_str().unwrap_or("").to_string();
+                emit(tx, role, "TRANSPORT_INVOICE_RECEIVED", serde_json::json!({
+                    "seeder": &req.seeder_urls[si],
+                    "bolt11": &bolt11,
+                    "chunks": chunks,
+                    "transport_price": resp["transport_price"],
+                }));
+                transports.push(SeederTransport {
+                    seeder_index: si,
+                    chunks: chunks.clone(),
+                    bolt11,
+                    ks: None,
+                });
+            }
+            Err(e) => {
+                emit(tx, role, "BUY_ERROR", serde_json::json!({
+                    "message": format!("Failed to get transport invoice from seeder {}: {}", si, e),
+                }));
+                return;
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // PHASE 5: Pay transport invoices, collect K_S per seeder
+    // -----------------------------------------------------------------------
+
+    for transport in &mut transports {
+        emit(tx, role, "TRANSPORT_PAYING", serde_json::json!({
+            "seeder": &req.seeder_urls[transport.seeder_index],
+            "bolt11": &transport.bolt11,
+            "chunks": &transport.chunks,
+        }));
+
+        match invoice::pay_invoice(node, &transport.bolt11) {
+            Ok(hash_bytes_ks) => {
+                let target_hash_ks = PaymentHash(hash_bytes_ks);
+                let rx_ks = router.register(target_hash_ks);
+                loop {
+                    let event = rx_ks.recv().expect("Event router dropped");
+                    match event {
+                        Event::PaymentSuccessful {
+                            payment_preimage: Some(preimage),
+                            fee_paid_msat,
+                            ..
+                        } => {
+                            transport.ks = Some(preimage.0);
+                            emit(tx, role, "TRANSPORT_PAID", serde_json::json!({
+                                "seeder": &req.seeder_urls[transport.seeder_index],
+                                "preimage_ks": hex::encode(preimage.0),
+                                "fee_msat": fee_paid_msat,
+                                "chunks": &transport.chunks,
+                            }));
+                            break;
+                        }
+                        Event::PaymentFailed { reason, .. } => {
+                            emit(tx, role, "TRANSPORT_PAYMENT_FAILED", serde_json::json!({
+                                "seeder": &req.seeder_urls[transport.seeder_index],
+                                "reason": format!("{:?}", reason),
+                                "message": "Transport payment failed for this seeder.",
+                            }));
+                            router.unregister(&target_hash_ks);
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+                router.unregister(&target_hash_ks);
+            }
+            Err(e) => {
+                emit(tx, role, "TRANSPORT_PAYMENT_FAILED", serde_json::json!({
+                    "seeder": &req.seeder_urls[transport.seeder_index],
+                    "error": format!("{:?}", e),
+                }));
+                return;
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // PHASE 6: Download wrapped chunks, unwrap with K_S, verify Merkle proofs
+    // -----------------------------------------------------------------------
+
+    let mut enc_chunks: Vec<Option<Vec<u8>>> = vec![None; chunk_count];
+
+    for transport in &transports {
+        let ks = match transport.ks {
+            Some(k) => k,
+            None => continue,
+        };
+
+        for &ci in &transport.chunks {
+            // Fetch wrapped chunk W_i
+            let wc_url = format!("{}/api/wrapped-chunks/{}/{}", &req.seeder_urls[transport.seeder_index], &enc_hash_hex, ci);
+            let wrapped_chunk = match client.get(&wc_url).send().and_then(|r| r.bytes()) {
+                Ok(b) => b.to_vec(),
+                Err(e) => {
+                    emit(tx, role, "CHUNK_DOWNLOAD_FAILED", serde_json::json!({
+                        "chunk_index": ci,
+                        "seeder": &req.seeder_urls[transport.seeder_index],
+                        "error": format!("{}", e),
+                    }));
+                    return;
+                }
+            };
+
+            // Unwrap: E_i = Dec(W_i, K_S, chunk_index=i)
+            let enc_chunk = encrypt::decrypt(&wrapped_chunk, &ks, ci as u64);
+
+            // Fetch Merkle proof and verify
+            let proof_url = format!("{}/api/chunks/{}/proof/{}", &req.seeder_urls[transport.seeder_index], &enc_hash_hex, ci);
+            match client.get(&proof_url).send().and_then(|r| r.json::<serde_json::Value>()) {
+                Ok(proof_json) => {
+                    // Verify chunk against encrypted Merkle root
+                    let proof_data = &proof_json["proof"];
+                    if let Ok(proof_json_obj) = serde_json::from_value::<conduit_core::merkle::MerkleProofJson>(proof_data.clone()) {
+                        if let Ok(proof) = conduit_core::merkle::MerkleProof::from_json(&proof_json_obj) {
+                            let root_bytes = hex::decode(&encrypted_root).unwrap_or_default();
+                            let mut root = [0u8; 32];
+                            if root_bytes.len() == 32 {
+                                root.copy_from_slice(&root_bytes);
+                            }
+                            if proof.verify(&enc_chunk, ci, &root) {
+                                emit(tx, role, "CHUNK_VERIFIED", serde_json::json!({
+                                    "chunk_index": ci,
+                                    "message": format!("Chunk {} Merkle proof verified", ci),
+                                }));
+                            } else {
+                                emit(tx, role, "CHUNK_VERIFICATION_FAILED", serde_json::json!({
+                                    "chunk_index": ci,
+                                    "message": format!("Chunk {} Merkle proof FAILED — seeder sent bad data!", ci),
+                                }));
+                                return;
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    emit(tx, role, "CHUNK_PROOF_FETCH_FAILED", serde_json::json!({
+                        "chunk_index": ci,
+                        "error": format!("{}", e),
+                        "message": "Proof fetch failed — continuing without verification",
+                    }));
+                }
+            }
+
+            enc_chunks[ci] = Some(enc_chunk);
+            emit(tx, role, "CHUNK_DOWNLOADED", serde_json::json!({
+                "chunk_index": ci,
+                "total": chunk_count,
+                "progress": format!("{}/{}", enc_chunks.iter().filter(|c| c.is_some()).count(), chunk_count),
+            }));
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // PHASE 7: Reassemble encrypted file, decrypt per-chunk, verify
+    // -----------------------------------------------------------------------
+
+    // Check all chunks received
+    for (ci, chunk) in enc_chunks.iter().enumerate() {
+        if chunk.is_none() {
+            emit(tx, role, "BUY_ERROR", serde_json::json!({
+                "message": format!("Missing encrypted chunk {}", ci),
+            }));
+            return;
+        }
+    }
+
+    // Decrypt each chunk: F_i = Dec(E_i, K, i)
+    let mut plaintext_chunks: Vec<Vec<u8>> = Vec::with_capacity(chunk_count);
+    for (ci, enc_chunk_opt) in enc_chunks.iter().enumerate() {
+        let enc_chunk = enc_chunk_opt.as_ref().unwrap();
+        let pt_chunk = encrypt::decrypt(enc_chunk, &key, ci as u64);
+        plaintext_chunks.push(pt_chunk);
+    }
+
+    emit(tx, role, "CHUNKS_DECRYPTED", serde_json::json!({
+        "chunk_count": chunk_count,
+        "message": format!("All {} chunks decrypted with K", chunk_count),
+    }));
+
+    // Reassemble plaintext
+    let original_size = meta["size_bytes"].as_u64().unwrap_or(0) as usize;
+    let mut plaintext: Vec<u8> = Vec::new();
+    for pt_chunk in &plaintext_chunks {
+        plaintext.extend_from_slice(pt_chunk);
+    }
+    // Truncate to original size (last chunk may have padding)
+    if original_size > 0 && plaintext.len() > original_size {
+        plaintext.truncate(original_size);
+    }
+
+    emit(tx, role, "CONTENT_REASSEMBLED", serde_json::json!({
+        "bytes": plaintext.len(),
+        "chunks": chunk_count,
+    }));
+
+    // Verify H(F)
+    let expected_hash_bytes = hex::decode(&req.hash).unwrap_or_default();
+    let actual_hash = verify::sha256_hash(&plaintext);
+    let matches = expected_hash_bytes.len() == 32 && actual_hash[..] == expected_hash_bytes[..];
+    emit(tx, role, "HASH_VERIFIED", serde_json::json!({
+        "matches": matches,
+        "expected": &req.hash,
+        "actual": hex::encode(actual_hash),
+    }));
+    if !matches {
+        emit(tx, role, "HASH_MISMATCH", serde_json::json!({
+            "expected": &req.hash,
+            "actual": hex::encode(actual_hash),
+            "message": "Content hash mismatch after reassembly!",
+        }));
+        return;
+    }
+
+    // Save
+    std::fs::write(&req.output, &plaintext).expect("Failed to write decrypted file");
+    emit(tx, role, "FILE_SAVED", serde_json::json!({
+        "path": &req.output,
+        "bytes": plaintext.len(),
+        "chunks": chunk_count,
+        "seeders": req.seeder_urls.len(),
+        "message": "Chunked multi-source content exchange complete.",
+    }));
+    println!();
+    println!("=== BUY COMPLETE (chunked) ===");
+    println!("Decrypted file: {} ({} bytes, {} chunks from {} seeders)", req.output, plaintext.len(), chunk_count, req.seeder_urls.len());
     println!("SHA-256 verified: content is authentic.");
 }
 
@@ -1610,11 +2436,18 @@ fn handle_buy(
     }
     router.unregister(&target_hash);
 
-    // 5. Decrypt
-    let decrypted = encrypt::decrypt(&ciphertext, &preimage_bytes, 0);
+    // 5. Decrypt per-chunk: F_i = Dec(E_i, K, i)
+    let cs = chunk::select_chunk_size(ciphertext.len());
+    let (enc_chunks, _meta) = chunk::split(&ciphertext, cs);
+    let decrypted: Vec<u8> = enc_chunks
+        .iter()
+        .enumerate()
+        .flat_map(|(i, c)| encrypt::decrypt(c, &preimage_bytes, i as u64))
+        .collect();
     emit(tx, role, "CONTENT_DECRYPTED", serde_json::json!({
         "bytes": decrypted.len(),
         "key": hex::encode(preimage_bytes),
+        "chunks": enc_chunks.len(),
     }));
 
     // 6. Verify
@@ -1692,6 +2525,11 @@ struct Cli {
     #[arg(long)]
     registry_url: Option<String>,
 
+    /// Public IP/hostname for this node (used in registry announcements).
+    /// If omitted, attempts to detect via external service.
+    #[arg(long)]
+    public_ip: Option<String>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -1744,6 +2582,9 @@ enum Commands {
         /// Price for transport in satoshis
         #[arg(long)]
         transport_price: u64,
+        /// Which chunks to seed (e.g. "0,1,2,5-9"). Omit to seed all.
+        #[arg(long)]
+        chunks: Option<String>,
     },
     /// Buy content: pay invoice, decrypt, verify
     Buy {
@@ -1819,11 +2660,25 @@ fn main() {
     }
 
     // Build registry info if --registry-url is set
+    // Resolve public IP for registry announcements
+    let public_ip = cli.public_ip.clone().unwrap_or_else(|| {
+        // Try to detect public IP via external service
+        reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .ok()
+            .and_then(|c| c.get("https://api.ipify.org").send().ok())
+            .and_then(|r| r.text().ok())
+            .map(|ip| ip.trim().to_string())
+            .unwrap_or_else(|| "0.0.0.0".to_string())
+    });
+    println!("Public IP: {}", public_ip);
+
     let registry_info = cli.registry_url.as_ref().map(|url| {
         let http_addr = cli.http_port
-            .map(|p| format!("0.0.0.0:{}", p))
+            .map(|p| format!("{}:{}", &public_ip, p))
             .unwrap_or_default();
-        let ln_addr = format!("0.0.0.0:{}", cli.port);
+        let ln_addr = format!("{}:{}", &public_ip, cli.port);
         RegistryInfo {
             url: url.trim_end_matches('/').to_string(),
             node_pubkey: id.clone(),
@@ -1917,8 +2772,9 @@ fn main() {
             encrypted_file,
             encrypted_hash,
             transport_price,
+            chunks,
         } => {
-            handle_seed(&events_tx, &config.storage_dir, &catalog, &encrypted_file, &encrypted_hash, transport_price, &registry_info);
+            handle_seed(&events_tx, &config.storage_dir, &catalog, &encrypted_file, &encrypted_hash, transport_price, &registry_info, &chunks);
         }
 
         Commands::Sell { file, price } => {
