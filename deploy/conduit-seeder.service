@@ -1,0 +1,26 @@
+[Unit]
+Description=Conduit Seeder Node (AWS)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/conduit
+ExecStart=/home/ubuntu/conduit/target/release/conduit-setup \
+  --storage-dir /tmp/conduit-seeder \
+  --port 9737 \
+  --rpc-host 137.184.18.6 --rpc-port 38332 \
+  --rpc-user lightning --rpc-password lightning \
+  --http-port 3002 \
+  --public-ip 54.89.56.74 \
+  --registry-url http://157.230.238.79:3003 \
+  serve
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=conduit-seeder
+
+[Install]
+WantedBy=multi-user.target

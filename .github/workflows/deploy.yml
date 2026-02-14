@@ -1,0 +1,141 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build release binary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release
+      - run: cargo build --release -p conduit-setup
+      - uses: actions/upload-artifact@v4
+        with:
+          name: conduit-setup
+          path: target/release/conduit-setup
+          retention-days: 5
+
+  deploy-creator:
+    name: Deploy Creator
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: conduit-setup
+      - name: Deploy to creator
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.CREATOR_HOST }}
+          username: root
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          source: conduit-setup
+          target: /root/conduit/target/release/
+          overwrite: true
+      - name: Restart service
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.CREATOR_HOST }}
+          username: root
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script: |
+            chmod +x /root/conduit/target/release/conduit-setup
+            systemctl restart conduit-creator
+            sleep 3
+            systemctl is-active conduit-creator
+
+  deploy-buyer:
+    name: Deploy Buyer
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: conduit-setup
+      - name: Deploy to buyer
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.BUYER_HOST }}
+          username: root
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          source: conduit-setup
+          target: /root/conduit/target/release/
+          overwrite: true
+      - name: Restart service
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.BUYER_HOST }}
+          username: root
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script: |
+            chmod +x /root/conduit/target/release/conduit-setup
+            systemctl restart conduit-buyer
+            sleep 3
+            systemctl is-active conduit-buyer
+
+  deploy-seeder:
+    name: Deploy Seeder (AWS)
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: conduit-setup
+      - name: Deploy to seeder
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SEEDER_HOST }}
+          username: ubuntu
+          key: ${{ secrets.SEEDER_SSH_KEY }}
+          source: conduit-setup
+          target: /home/ubuntu/conduit/target/release/
+          overwrite: true
+      - name: Restart service
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SEEDER_HOST }}
+          username: ubuntu
+          key: ${{ secrets.SEEDER_SSH_KEY }}
+          script: |
+            chmod +x /home/ubuntu/conduit/target/release/conduit-setup
+            sudo systemctl restart conduit-seeder
+            sleep 3
+            sudo systemctl is-active conduit-seeder
+
+  deploy-seeder2:
+    name: Deploy Seeder 2 (Registry Droplet)
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: conduit-setup
+      - name: Deploy to seeder2
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.REGISTRY_HOST }}
+          username: root
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          source: conduit-setup
+          target: /root/conduit/target/release/
+          overwrite: true
+      - name: Restart service
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.REGISTRY_HOST }}
+          username: root
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script: |
+            chmod +x /root/conduit/target/release/conduit-setup
+            systemctl restart conduit-seeder2
+            sleep 3
+            systemctl is-active conduit-seeder2

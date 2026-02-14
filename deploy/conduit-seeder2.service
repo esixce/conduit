@@ -1,0 +1,26 @@
+[Unit]
+Description=Conduit Seeder 2 Node (Registry Droplet)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/conduit
+ExecStart=/root/conduit/target/release/conduit-setup \
+  --storage-dir /tmp/conduit-seeder2 \
+  --port 9738 \
+  --rpc-host 137.184.18.6 --rpc-port 38332 \
+  --rpc-user lightning --rpc-password lightning \
+  --http-port 3004 \
+  --public-ip 157.230.238.79 \
+  --registry-url http://157.230.238.79:3003 \
+  serve
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=conduit-seeder2
+
+[Install]
+WantedBy=multi-user.target
