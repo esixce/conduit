@@ -1,0 +1,13 @@
+[package]
+name = "conduit-buyer"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Conduit buyer CLI: download encrypted content, pay invoice, decrypt"
+
+[dependencies]
+conduit-core = { path = "../conduit-core" }
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["blocking"] }
+clap = { version = "4", features = ["derive"] }
+hex = "0.4"
