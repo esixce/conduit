@@ -11,6 +11,7 @@
 //! Design: [`docs/02_p2p_distribution.md`], Section 3.
 
 use crate::verify::sha256_hash;
+use serde::{Deserialize, Serialize};
 
 // Domain-separation prefixes (RFC 6962).
 const LEAF_PREFIX: u8 = 0x00;
@@ -52,6 +53,15 @@ pub struct MerkleProof {
     /// Each entry is `(hash, is_left)` where `is_left` indicates
     /// whether the sibling is on the left side.
     pub siblings: Vec<([u8; 32], bool)>,
+}
+
+/// JSON-serializable representation of a Merkle proof.
+/// Used for HTTP API responses (`/api/chunks/{id}/proof/{index}`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MerkleProofJson {
+    /// Sibling hashes and directions: `[["hex_hash", true/false], ...]`
+    /// `true` means the sibling is on the left.
+    pub siblings: Vec<(String, bool)>,
 }
 
 impl MerkleTree {
@@ -158,6 +168,29 @@ impl MerkleProof {
         }
 
         hash == *expected_root
+    }
+
+    /// Convert to a JSON-serializable representation.
+    pub fn to_json(&self) -> MerkleProofJson {
+        MerkleProofJson {
+            siblings: self
+                .siblings
+                .iter()
+                .map(|(hash, is_left)| (hex::encode(hash), *is_left))
+                .collect(),
+        }
+    }
+
+    /// Reconstruct from a JSON representation.
+    pub fn from_json(json: &MerkleProofJson) -> Result<Self, hex::FromHexError> {
+        let mut siblings = Vec::with_capacity(json.siblings.len());
+        for (hex_hash, is_left) in &json.siblings {
+            let bytes = hex::decode(hex_hash)?;
+            let mut hash = [0u8; 32];
+            hash.copy_from_slice(&bytes);
+            siblings.push((hash, *is_left));
+        }
+        Ok(MerkleProof { siblings })
     }
 }
 
@@ -386,5 +419,30 @@ mod tests {
             .collect();
         let reassembled = chunk::reassemble(&decrypted_chunks, meta.original_size);
         assert_eq!(reassembled, plaintext);
+    }
+
+    #[test]
+    fn test_proof_json_round_trip() {
+        let chunks: Vec<Vec<u8>> = (0..7)
+            .map(|i| format!("chunk number {}", i).into_bytes())
+            .collect();
+        let tree = MerkleTree::from_chunks(&chunks);
+        let root = tree.root();
+
+        for (i, chunk) in chunks.iter().enumerate() {
+            let proof = tree.proof(i);
+            let json = proof.to_json();
+
+            // Serialize to JSON string and back
+            let json_str = serde_json::to_string(&json).unwrap();
+            let json_back: super::MerkleProofJson = serde_json::from_str(&json_str).unwrap();
+            let proof_back = MerkleProof::from_json(&json_back).unwrap();
+
+            assert!(
+                proof_back.verify(chunk, i, &root),
+                "JSON round-trip proof verification failed for chunk {}",
+                i
+            );
+        }
     }
 }
