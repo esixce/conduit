@@ -1,0 +1,8 @@
+[workspace]
+members = [
+    "crates/conduit-core",
+    "crates/conduit-creator",
+    "crates/conduit-buyer",
+    "crates/conduit-setup",
+]
+resolver = "2"
