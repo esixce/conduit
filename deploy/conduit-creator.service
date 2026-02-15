@@ -8,13 +8,14 @@ Type=simple
 User=root
 WorkingDirectory=/root/conduit
 ExecStart=/root/conduit/target/release/conduit-setup \
-  --storage-dir /tmp/conduit-creator \
+  --storage-dir /var/lib/conduit-creator \
   --port 9735 \
   --rpc-host 137.184.18.6 --rpc-port 38332 \
   --rpc-user lightning --rpc-password lightning \
   --http-port 3000 \
   --public-ip 167.172.152.231 \
   --registry-url http://157.230.238.79:3003 \
+  --dashboard /root/conduit/dashboard.html \
   serve
 Restart=on-failure
 RestartSec=5

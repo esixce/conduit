@@ -30,16 +30,16 @@ echo "==> Stopping any existing nohup process..."
 # Try to find and kill existing conduit processes matching this service
 case "$SERVICE_NAME" in
     conduit-creator)
-        pkill -f "conduit-setup.*storage-dir.*/tmp/conduit-creator" || true
+        pkill -f "conduit-setup.*storage-dir.*/var/lib/conduit-creator" || true
         ;;
     conduit-buyer)
-        pkill -f "conduit-setup.*storage-dir.*/tmp/conduit-buyer" || true
+        pkill -f "conduit-setup.*storage-dir.*/var/lib/conduit-buyer" || true
         ;;
     conduit-seeder)
-        pkill -f "conduit-setup.*storage-dir.*/tmp/conduit-seeder[^2]" || true
+        pkill -f "conduit-setup.*storage-dir.*/var/lib/conduit-seeder[^2]" || true
         ;;
     conduit-seeder2)
-        pkill -f "conduit-setup.*storage-dir.*/tmp/conduit-seeder2" || true
+        pkill -f "conduit-setup.*storage-dir.*/var/lib/conduit-seeder2" || true
         ;;
     conduit-registry)
         pkill -f "conduit-registry" || true
