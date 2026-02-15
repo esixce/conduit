@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::response::sse::{Event as SseEvent, Sse};
 use axum::response::{Html, Json};
 use axum::extract::Path as AxumPath;
@@ -53,6 +53,7 @@ use uuid::Uuid;
 
 #[derive(Clone, Debug, Serialize)]
 struct ConsoleEvent {
+    id: u64,
     timestamp: String,
     role: String,
     event_type: String,
@@ -67,16 +68,130 @@ fn now_ts() -> String {
     format!("{:02}:{:02}:{:02}", (secs / 3600) % 24, (secs / 60) % 60, secs % 60)
 }
 
-fn emit(tx: &broadcast::Sender<ConsoleEvent>, role: &str, event_type: &str, data: serde_json::Value) {
-    let event = ConsoleEvent {
-        timestamp: now_ts(),
-        role: role.into(),
-        event_type: event_type.into(),
-        data,
-    };
-    // Also print to terminal
-    println!("[{}] {:<20} {}", event.role, event.event_type, event.data);
-    let _ = tx.send(event);
+/// Append-only event log on disk (SQLite). Used for history API and audit trail.
+struct EventLog {
+    conn: std::sync::Mutex<Connection>,
+}
+
+impl EventLog {
+    fn new(storage_dir: &str) -> Result<Self, rusqlite::Error> {
+        let path = std::path::Path::new(storage_dir).join("events.db");
+        let conn = Connection::open(path)?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS events (
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                role      TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                data      TEXT NOT NULL
+            )",
+            [],
+        )?;
+        Ok(Self {
+            conn: std::sync::Mutex::new(conn),
+        })
+    }
+
+    fn append(&self, event: &ConsoleEvent) -> Result<u64, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO events (timestamp, role, event_type, data) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                event.timestamp,
+                event.role,
+                event.event_type,
+                serde_json::to_string(&event.data).unwrap_or_default(),
+            ],
+        )?;
+        Ok(conn.last_insert_rowid() as u64)
+    }
+
+    fn query(
+        &self,
+        since_id: u64,
+        limit: u32,
+        role_filter: Option<&str>,
+    ) -> Result<Vec<ConsoleEvent>, rusqlite::Error> {
+        let limit = limit.min(1000);
+        let conn = self.conn.lock().unwrap();
+        let mut out = Vec::new();
+        if let Some(role) = role_filter {
+            let mut stmt = conn.prepare(
+                "SELECT id, timestamp, role, event_type, data FROM events WHERE id > ?1 AND role = ?2 ORDER BY id ASC LIMIT ?3",
+            )?;
+            let mapped = stmt.query_map(rusqlite::params![since_id as i64, role, limit as i32], |row| {
+                let data_str: String = row.get(4)?;
+                let data = serde_json::from_str(&data_str).unwrap_or(serde_json::Value::Null);
+                Ok(ConsoleEvent {
+                    id: row.get::<_, i64>(0)? as u64,
+                    timestamp: row.get(1)?,
+                    role: row.get(2)?,
+                    event_type: row.get(3)?,
+                    data,
+                })
+            })?;
+            for row in mapped {
+                out.push(row?);
+            }
+        } else {
+            let mut stmt = conn.prepare(
+                "SELECT id, timestamp, role, event_type, data FROM events WHERE id > ?1 ORDER BY id ASC LIMIT ?2",
+            )?;
+            let mapped = stmt.query_map(rusqlite::params![since_id as i64, limit as i32], |row| {
+                let data_str: String = row.get(4)?;
+                let data = serde_json::from_str(&data_str).unwrap_or(serde_json::Value::Null);
+                Ok(ConsoleEvent {
+                    id: row.get::<_, i64>(0)? as u64,
+                    timestamp: row.get(1)?,
+                    role: row.get(2)?,
+                    event_type: row.get(3)?,
+                    data,
+                })
+            })?;
+            for row in mapped {
+                out.push(row?);
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Single path for emitting console events: persist to log (if present) then broadcast.
+#[derive(Clone)]
+struct ConsoleEmitter {
+    tx: broadcast::Sender<ConsoleEvent>,
+    log: Option<Arc<EventLog>>,
+}
+
+impl ConsoleEmitter {
+    fn new(tx: broadcast::Sender<ConsoleEvent>, log: Option<Arc<EventLog>>) -> Self {
+        Self { tx, log }
+    }
+
+    fn subscribe(&self) -> broadcast::Receiver<ConsoleEvent> {
+        self.tx.subscribe()
+    }
+
+    fn event_log(&self) -> Option<Arc<EventLog>> {
+        self.log.clone()
+    }
+
+    fn emit(&self, role: &str, event_type: &str, data: serde_json::Value) {
+        let mut event = ConsoleEvent {
+            id: 0,
+            timestamp: now_ts(),
+            role: role.into(),
+            event_type: event_type.into(),
+            data,
+        };
+        if let Some(ref log) = self.log {
+            if let Ok(id) = log.append(&event) {
+                event.id = id;
+            }
+        }
+        println!("[{}] {:<20} {}", event.role, event.event_type, event.data);
+        let _ = self.tx.send(event);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -89,15 +204,15 @@ fn emit(tx: &broadcast::Sender<ConsoleEvent>, role: &str, event_type: &str, data
 /// other handlers or eat events meant for the node's internal state machine.
 struct EventRouter {
     waiters: std::sync::Mutex<std::collections::HashMap<PaymentHash, std::sync::mpsc::Sender<Event>>>,
-    console_tx: broadcast::Sender<ConsoleEvent>,
+    emitter: Arc<ConsoleEmitter>,
     role: std::sync::Mutex<String>,
 }
 
 impl EventRouter {
-    fn new(console_tx: broadcast::Sender<ConsoleEvent>) -> Self {
+    fn new(emitter: Arc<ConsoleEmitter>) -> Self {
         Self {
             waiters: std::sync::Mutex::new(std::collections::HashMap::new()),
-            console_tx,
+            emitter,
             role: std::sync::Mutex::new("node".into()),
         }
     }
@@ -148,7 +263,7 @@ impl EventRouter {
 
             if !delivered {
                 let role = self.role.lock().unwrap().clone();
-                emit(&self.console_tx, &role, "LDK_EVENT", serde_json::json!({
+                self.emitter.emit(&role, "LDK_EVENT", serde_json::json!({
                     "event": format!("{:?}", event),
                 }));
             }
@@ -183,7 +298,7 @@ struct RegistryInfo {
 #[derive(Clone)]
 struct AppState {
     node: Arc<Node>,
-    events_tx: broadcast::Sender<ConsoleEvent>,
+    emitter: Arc<ConsoleEmitter>,
     event_router: Arc<EventRouter>,
     catalog: Arc<std::sync::Mutex<Vec<CatalogEntry>>>,
     storage_dir: String,
@@ -267,11 +382,11 @@ async fn address_handler(State(state): State<AppState>) -> impl IntoResponse {
 async fn sse_handler(
     State(state): State<AppState>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<SseEvent, Infallible>>> {
-    let rx = state.events_tx.subscribe();
+    let rx = state.emitter.subscribe();
     let stream = BroadcastStream::new(rx).filter_map(|result| {
         result.ok().map(|event| {
             let json = serde_json::to_string(&event).unwrap_or_default();
-            Ok::<_, Infallible>(SseEvent::default().data(json))
+            Ok::<_, Infallible>(SseEvent::default().id(event.id.to_string()).data(json))
         })
     });
     Sse::new(stream).keep_alive(
@@ -279,6 +394,32 @@ async fn sse_handler(
             .interval(Duration::from_secs(15))
             .text("ping"),
     )
+}
+
+#[derive(Deserialize)]
+struct EventsHistoryQuery {
+    #[serde(default)]
+    since_id: Option<u64>,
+    #[serde(default)]
+    limit: Option<u32>,
+    #[serde(default)]
+    role: Option<String>,
+}
+
+/// GET /api/events/history -- paginated event log (since_id, limit, role)
+async fn events_history_handler(
+    State(state): State<AppState>,
+    Query(q): Query<EventsHistoryQuery>,
+) -> Json<Vec<ConsoleEvent>> {
+    let since_id = q.since_id.unwrap_or(0);
+    let limit = q.limit.unwrap_or(100).min(1000);
+    let role = q.role.as_deref();
+    let events = state
+        .emitter
+        .event_log()
+        .and_then(|log| log.query(since_id, limit, role).ok())
+        .unwrap_or_default();
+    Json(events)
 }
 
 // ---------------------------------------------------------------------------
@@ -589,10 +730,10 @@ async fn sell_handler(
     Json(req): Json<SellRequest>,
 ) -> Json<serde_json::Value> {
     let node = state.node.clone();
-    let tx = state.events_tx.clone();
+    let tx = state.emitter.clone();
     let router = state.event_router.clone();
     thread::spawn(move || {
-        handle_sell(&node, &tx, &router, &req.file, req.price);
+        handle_sell(&node, tx.as_ref(), &router, &req.file, req.price);
     });
     Json(serde_json::json!({"status": "started"}))
 }
@@ -602,43 +743,43 @@ async fn buy_handler(
     Json(req): Json<BuyRequest>,
 ) -> Json<serde_json::Value> {
     let node = state.node.clone();
-    let tx = state.events_tx.clone();
+    let tx = state.emitter.clone();
     let router = state.event_router.clone();
     let is_chunked = matches!(req.mode.as_deref(), Some("chunked") | Some("seeder"));
     let is_two_phase = req.transport_invoice.is_some() && req.content_invoice.is_some();
     thread::spawn(move || {
         if is_chunked {
             // --- Chunked buy: multi-source chunk download (A5) ---
-            handle_buy_chunked(&node, &tx, &router, &req);
+            handle_buy_chunked(&node, tx.as_ref(), &router, &req);
         } else if is_two_phase {
             // --- Two-phase buy: seeder + creator ---
-            handle_buy_two_phase(&node, &tx, &router, &req);
+            handle_buy_two_phase(&node, tx.as_ref(), &router, &req);
         } else {
             // --- Legacy single-phase buy ---
             let enc_path = if let Some(ref url) = req.enc_url {
-                match curl_fetch(url, &tx) {
+                match curl_fetch(url, tx.as_ref()) {
                     Some(path) => path,
                     None => return,
                 }
             } else if let Some(ref path) = req.encrypted_file {
                 path.clone()
             } else {
-                emit(&tx, "buyer", "BUY_ERROR", serde_json::json!({
+                tx.emit("buyer", "BUY_ERROR", serde_json::json!({
                     "message": "No encrypted_file, enc_url, or wrapped_url provided",
                 }));
                 return;
             };
             let invoice = req.invoice.as_deref().unwrap_or("");
-            handle_buy(&node, &tx, &router, invoice, &enc_path, &req.hash, &req.output);
+            handle_buy(&node, tx.as_ref(), &router, invoice, &enc_path, &req.hash, &req.output);
         }
     });
     Json(serde_json::json!({"status": "started"}))
 }
 
 /// Download a URL to /tmp/ via curl, emitting SSE events. Returns local path on success.
-fn curl_fetch(url: &str, tx: &broadcast::Sender<ConsoleEvent>) -> Option<String> {
+fn curl_fetch(url: &str, emitter: &ConsoleEmitter) -> Option<String> {
     let local = format!("/tmp/fetched-{}", url.split('/').last().unwrap_or("download.enc"));
-    emit(tx, "buyer", "FETCHING_ENC", serde_json::json!({
+    emitter.emit("buyer", "FETCHING_ENC", serde_json::json!({
         "url": url,
         "message": "Downloading encrypted file...",
     }));
@@ -648,7 +789,7 @@ fn curl_fetch(url: &str, tx: &broadcast::Sender<ConsoleEvent>) -> Option<String>
     match curl {
         Ok(out) if out.status.success() => {
             let bytes = std::fs::metadata(&local).map(|m| m.len()).unwrap_or(0);
-            emit(tx, "buyer", "ENC_FETCHED", serde_json::json!({
+            emitter.emit("buyer", "ENC_FETCHED", serde_json::json!({
                 "bytes": bytes,
                 "path": &local,
             }));
@@ -656,13 +797,13 @@ fn curl_fetch(url: &str, tx: &broadcast::Sender<ConsoleEvent>) -> Option<String>
         }
         Ok(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr);
-            emit(tx, "buyer", "FETCH_FAILED", serde_json::json!({
+            emitter.emit("buyer", "FETCH_FAILED", serde_json::json!({
                 "error": format!("curl failed: {}", stderr),
             }));
             None
         }
         Err(e) => {
-            emit(tx, "buyer", "FETCH_FAILED", serde_json::json!({
+            emitter.emit("buyer", "FETCH_FAILED", serde_json::json!({
                 "error": format!("curl not found: {}", e),
             }));
             None
@@ -674,12 +815,12 @@ async fn seed_handler(
     State(state): State<AppState>,
     Json(req): Json<SeedRequest>,
 ) -> Json<serde_json::Value> {
-    let tx = state.events_tx.clone();
+    let tx = state.emitter.clone();
     let catalog = state.catalog.clone();
     let storage_dir = state.storage_dir.clone();
     let registry_info = state.registry_info.clone();
     thread::spawn(move || {
-        handle_seed(&tx, &storage_dir, &catalog, &req.encrypted_file, &req.encrypted_hash, req.transport_price, &registry_info, &req.chunks);
+        handle_seed(tx.as_ref(), &storage_dir, &catalog, &req.encrypted_file, &req.encrypted_hash, req.transport_price, &registry_info, &req.chunks);
     });
     Json(serde_json::json!({"status": "started"}))
 }
@@ -753,16 +894,26 @@ async fn catalog_handler(State(state): State<AppState>) -> Json<serde_json::Valu
     Json(serde_json::json!({ "items": items }))
 }
 
+/// DELETE /api/catalog -- clear local catalog (for test re-provisioning)
+async fn catalog_clear_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let mut cat = state.catalog.lock().unwrap();
+    let count = cat.len();
+    cat.clear();
+    save_catalog(&state.storage_dir, &cat);
+    println!("Catalog cleared ({} entries removed)", count);
+    Json(serde_json::json!({ "deleted": count }))
+}
+
 async fn register_api_handler(
     State(state): State<AppState>,
     Json(req): Json<RegisterRequest>,
 ) -> Json<serde_json::Value> {
-    let tx = state.events_tx.clone();
+    let tx = state.emitter.clone();
     let catalog = state.catalog.clone();
     let storage_dir = state.storage_dir.clone();
     let registry_info = state.registry_info.clone();
     thread::spawn(move || {
-        handle_register(&tx, &storage_dir, &catalog, &req.file, req.price, &registry_info);
+        handle_register(tx.as_ref(), &storage_dir, &catalog, &req.file, req.price, &registry_info);
     });
     Json(serde_json::json!({"status": "started"}))
 }
@@ -803,8 +954,8 @@ async fn invoice_handler(
     let enc_filename = entry.enc_file_path.split('/').last().unwrap_or("").to_string();
 
     // Emit SSE event so the console can see it
-    let tx = state.events_tx.clone();
-    emit(&tx, "creator", "INVOICE_CREATED", serde_json::json!({
+    let emitter = state.emitter.clone();
+    emitter.emit( "creator", "INVOICE_CREATED", serde_json::json!({
         "payment_hash": &payment_hash,
         "content_hash": &entry.content_hash,
         "encrypted_hash": &entry.encrypted_hash,
@@ -816,7 +967,7 @@ async fn invoice_handler(
 
     // Spawn a thread to wait for payment and claim it
     let node = state.node.clone();
-    let tx2 = state.events_tx.clone();
+    let tx2 = state.emitter.clone();
     let router = state.event_router.clone();
     thread::spawn(move || {
         handle_sell_from_catalog(&node, &tx2, &router, &key);
@@ -946,8 +1097,8 @@ async fn ad_invoice_handler(
     let enc_filename = entry.enc_file_path.split('/').last().unwrap_or("").to_string();
 
     // Emit SSE event
-    let tx = state.events_tx.clone();
-    emit(&tx, "creator", "AD_INVOICE_CREATED", serde_json::json!({
+    let emitter = state.emitter.clone();
+    emitter.emit( "creator", "AD_INVOICE_CREATED", serde_json::json!({
         "buyer_payment_hash": &buyer_payment_hash,
         "ad_payment_hash": &ad_payment_hash,
         "content_hash": &entry.content_hash,
@@ -975,7 +1126,7 @@ async fn ad_invoice_handler(
     // -----------------------------------------------------------------------
     {
         let node = state.node.clone();
-        let tx2 = state.events_tx.clone();
+        let tx2 = state.emitter.clone();
         let router = state.event_router.clone();
         thread::spawn(move || {
             handle_ad_sell_hold_and_claim(&node, &tx2, &router, &key, &k_ad);
@@ -1068,8 +1219,8 @@ async fn transport_invoice_handler(
 
         let payment_hash = hex::encode(verify::sha256_hash(&ks));
 
-        let tx = state.events_tx.clone();
-        emit(&tx, "seeder", "TRANSPORT_INVOICE_CREATED", serde_json::json!({
+        let emitter = state.emitter.clone();
+        emitter.emit( "seeder", "TRANSPORT_INVOICE_CREATED", serde_json::json!({
             "payment_hash": &payment_hash,
             "amount_sats": entry.transport_price,
             "bolt11": &bolt11,
@@ -1078,7 +1229,7 @@ async fn transport_invoice_handler(
         }));
 
         let node = state.node.clone();
-        let tx2 = state.events_tx.clone();
+        let tx2 = state.emitter.clone();
         let router = state.event_router.clone();
         thread::spawn(move || {
             handle_transport_payment(&node, &tx2, &router, &ks);
@@ -1139,8 +1290,8 @@ async fn transport_invoice_handler(
 
         let payment_hash = hex::encode(verify::sha256_hash(&ks));
 
-        let tx = state.events_tx.clone();
-        emit(&tx, "seeder", "TRANSPORT_INVOICE_CREATED", serde_json::json!({
+        let emitter = state.emitter.clone();
+        emitter.emit( "seeder", "TRANSPORT_INVOICE_CREATED", serde_json::json!({
             "payment_hash": &payment_hash,
             "amount_sats": entry.transport_price,
             "bolt11": &bolt11,
@@ -1150,7 +1301,7 @@ async fn transport_invoice_handler(
         }));
 
         let node = state.node.clone();
-        let tx2 = state.events_tx.clone();
+        let tx2 = state.emitter.clone();
         let router = state.event_router.clone();
         thread::spawn(move || {
             handle_transport_payment(&node, &tx2, &router, &ks);
@@ -1171,7 +1322,7 @@ async fn transport_invoice_handler(
 /// Wait for a transport payment and claim it (reveals K_S to buyer).
 fn handle_transport_payment(
     node: &Arc<Node>,
-    tx: &broadcast::Sender<ConsoleEvent>,
+    emitter: &ConsoleEmitter,
     router: &Arc<EventRouter>,
     ks: &[u8; 32],
 ) {
@@ -1179,7 +1330,7 @@ fn handle_transport_payment(
     let payment_hash_bytes = verify::sha256_hash(ks);
     let expected_hash = PaymentHash(payment_hash_bytes);
 
-    emit(tx, role, "WAITING_FOR_TRANSPORT_PAYMENT", serde_json::json!({
+    emitter.emit( role, "WAITING_FOR_TRANSPORT_PAYMENT", serde_json::json!({
         "payment_hash": hex::encode(payment_hash_bytes),
         "message": "Listening for incoming transport HTLC...",
     }));
@@ -1194,7 +1345,7 @@ fn handle_transport_payment(
                 claim_deadline,
                 ..
             } => {
-                emit(tx, role, "TRANSPORT_HTLC_RECEIVED", serde_json::json!({
+                emitter.emit( role, "TRANSPORT_HTLC_RECEIVED", serde_json::json!({
                     "payment_hash": hex::encode(hash.0),
                     "amount_msat": claimable_amount_msat,
                     "claim_deadline": claim_deadline,
@@ -1202,7 +1353,7 @@ fn handle_transport_payment(
 
                 invoice::claim_payment(node, ks, claimable_amount_msat)
                     .expect("Failed to claim transport payment");
-                emit(tx, role, "TRANSPORT_PAYMENT_CLAIMED", serde_json::json!({
+                emitter.emit( role, "TRANSPORT_PAYMENT_CLAIMED", serde_json::json!({
                     "preimage": hex::encode(ks),
                     "message": "Transport key K_S revealed to buyer via HTLC settlement",
                 }));
@@ -1212,7 +1363,7 @@ fn handle_transport_payment(
                 amount_msat,
                 ..
             } => {
-                emit(tx, role, "TRANSPORT_PAYMENT_RECEIVED", serde_json::json!({
+                emitter.emit( role, "TRANSPORT_PAYMENT_RECEIVED", serde_json::json!({
                     "payment_hash": hex::encode(hash.0),
                     "amount_msat": amount_msat,
                     "message": "Transport payment confirmed. Content delivered.",
@@ -1744,6 +1895,85 @@ async fn adv_serve_creative(
     }
 }
 
+/// POST /api/campaigns -- create a new campaign via API
+async fn adv_create_campaign(
+    State(state): State<AppState>,
+    Json(req): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let db = match &state.advertiser_db {
+        Some(db) => db,
+        None => return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error": "Advertiser role not enabled"}))).into_response(),
+    };
+    let name = req["name"].as_str().unwrap_or("Unnamed Campaign").to_string();
+    let creative_file = req["creative_file"].as_str().unwrap_or("").to_string();
+    let duration_ms = req["duration_ms"].as_u64().unwrap_or(15000);
+    let subsidy_sats = req["subsidy_sats"].as_u64().unwrap_or(50);
+    let budget_total = req["budget_total_sats"].as_u64().unwrap_or(1_000_000);
+
+    if creative_file.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "creative_file is required"}))).into_response();
+    }
+
+    // Compute creative hash and format
+    let ads_dir = state.ads_dir.as_deref().unwrap_or("/tmp");
+    let file_path = format!("{}/{}", ads_dir, creative_file);
+    let creative_hash = match adv_sha256_file(&file_path) {
+        Ok(h) => h,
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("Cannot read creative file: {}", e)}))).into_response(),
+    };
+    let ext = std::path::Path::new(&creative_file)
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    let creative_format = match ext.as_str() {
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        _ => "application/octet-stream",
+    };
+
+    let campaign_id = Uuid::new_v4().to_string();
+    let db = db.lock().unwrap();
+    db.execute(
+        "INSERT INTO campaigns
+         (campaign_id, name, creative_file, creative_hash, creative_format,
+          duration_ms, subsidy_sats, budget_total_sats, budget_spent_sats,
+          active, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, 1, ?9)",
+        rusqlite::params![
+            campaign_id, name, creative_file,
+            creative_hash, creative_format, duration_ms, subsidy_sats, budget_total,
+            adv_now_unix(),
+        ],
+    )
+    .unwrap();
+    println!("[advertiser] Campaign created via API: {} ({})", name, campaign_id);
+    (StatusCode::OK, Json(serde_json::json!({
+        "campaign_id": campaign_id,
+        "name": name,
+        "creative_file": creative_file,
+        "creative_format": creative_format,
+    }))).into_response()
+}
+
+/// DELETE /api/campaigns -- clear all campaigns (for test re-provisioning)
+async fn adv_clear_campaigns(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let db = match &state.advertiser_db {
+        Some(db) => db,
+        None => return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error": "Advertiser role not enabled"}))).into_response(),
+    };
+    let db = db.lock().unwrap();
+    let deleted = db.execute("DELETE FROM campaigns", []).unwrap_or(0);
+    let _ = db.execute("DELETE FROM sessions", []);
+    let _ = db.execute("DELETE FROM adv_payments", []);
+    println!("[advertiser] Cleared {} campaigns", deleted);
+    (StatusCode::OK, Json(serde_json::json!({ "deleted": deleted }))).into_response()
+}
+
 /// POST /api/campaigns/{campaign_id}/start -- begin a viewing session
 async fn adv_start_session(
     State(state): State<AppState>,
@@ -1929,7 +2159,8 @@ fn start_http_server(port: u16, state: AppState) {
                 .route("/api/info", get(info_handler))
                 .route("/api/address", get(address_handler))
                 .route("/api/events", get(sse_handler))
-                .route("/api/catalog", get(catalog_handler))
+                .route("/api/events/history", get(events_history_handler))
+                .route("/api/catalog", get(catalog_handler).delete(catalog_clear_handler))
                 .route("/api/register", post(register_api_handler))
                 .route("/api/invoice/{content_hash}", post(invoice_handler))
                 .route("/api/ad-invoice/{content_hash}", post(ad_invoice_handler))
@@ -1947,7 +2178,7 @@ fn start_http_server(port: u16, state: AppState) {
                 .route("/api/chunks/{encrypted_hash}/bitfield", get(chunk_bitfield_handler))
                 .route("/api/wrapped-chunks/{encrypted_hash}/{index}", get(wrapped_chunk_handler))
                 // Advertiser role routes
-                .route("/api/campaigns", get(adv_list_campaigns))
+                .route("/api/campaigns", get(adv_list_campaigns).post(adv_create_campaign).delete(adv_clear_campaigns))
                 .route("/api/campaigns/{campaign_id}", get(adv_get_campaign))
                 .route("/api/campaigns/{campaign_id}/creative", get(adv_serve_creative))
                 .route("/api/campaigns/{campaign_id}/start", post(adv_start_session))
@@ -1969,7 +2200,7 @@ fn start_http_server(port: u16, state: AppState) {
 // sell command
 // ---------------------------------------------------------------------------
 
-fn handle_sell(node: &Arc<Node>, tx: &broadcast::Sender<ConsoleEvent>, router: &Arc<EventRouter>, file_path: &str, price: u64) {
+fn handle_sell(node: &Arc<Node>, emitter: &ConsoleEmitter, router: &Arc<EventRouter>, file_path: &str, price: u64) {
     let role = "creator";
 
     // 1. Read file
@@ -1978,20 +2209,20 @@ fn handle_sell(node: &Arc<Node>, tx: &broadcast::Sender<ConsoleEvent>, router: &
 
     // 2. Generate key
     let key = encrypt::generate_key();
-    emit(tx, role, "KEY_GENERATED", serde_json::json!({
+    emitter.emit( role, "KEY_GENERATED", serde_json::json!({
         "key": hex::encode(key),
     }));
 
     // 3. Encrypt
     let ciphertext = encrypt::encrypt(&plaintext, &key, 0);
-    emit(tx, role, "CONTENT_ENCRYPTED", serde_json::json!({
+    emitter.emit( role, "CONTENT_ENCRYPTED", serde_json::json!({
         "plaintext_bytes": plaintext.len(),
         "ciphertext_bytes": ciphertext.len(),
     }));
 
     // 4. Hash plaintext
     let file_hash = verify::sha256_hash(&plaintext);
-    emit(tx, role, "HASH_COMPUTED", serde_json::json!({
+    emitter.emit( role, "HASH_COMPUTED", serde_json::json!({
         "hash": hex::encode(file_hash),
     }));
 
@@ -2002,7 +2233,7 @@ fn handle_sell(node: &Arc<Node>, tx: &broadcast::Sender<ConsoleEvent>, router: &
     let enc_path = format!("{}.enc", file_path);
     let enc_filename = enc_path.split('/').last().unwrap_or("").to_string();
     let enc_hash = verify::sha256_hash(&ciphertext);
-    emit(tx, role, "INVOICE_CREATED", serde_json::json!({
+    emitter.emit( role, "INVOICE_CREATED", serde_json::json!({
         "payment_hash": hex::encode(payment_hash),
         "content_hash": hex::encode(file_hash),
         "encrypted_hash": hex::encode(enc_hash),
@@ -2014,7 +2245,7 @@ fn handle_sell(node: &Arc<Node>, tx: &broadcast::Sender<ConsoleEvent>, router: &
 
     // 6. Save encrypted file
     std::fs::write(&enc_path, &ciphertext).expect("Failed to write encrypted file");
-    emit(tx, role, "ENCRYPTED_FILE_SAVED", serde_json::json!({
+    emitter.emit( role, "ENCRYPTED_FILE_SAVED", serde_json::json!({
         "path": &enc_path,
         "encrypted_hash": hex::encode(enc_hash),
         "bytes": ciphertext.len(),
@@ -2030,7 +2261,7 @@ fn handle_sell(node: &Arc<Node>, tx: &broadcast::Sender<ConsoleEvent>, router: &
     println!();
 
     // 8. Wait for payment via event router
-    emit(tx, role, "WAITING_FOR_PAYMENT", serde_json::json!({
+    emitter.emit( role, "WAITING_FOR_PAYMENT", serde_json::json!({
         "message": "Listening for incoming HTLC..."
     }));
 
@@ -2045,7 +2276,7 @@ fn handle_sell(node: &Arc<Node>, tx: &broadcast::Sender<ConsoleEvent>, router: &
                 claim_deadline,
                 ..
             } => {
-                emit(tx, role, "HTLC_RECEIVED", serde_json::json!({
+                emitter.emit( role, "HTLC_RECEIVED", serde_json::json!({
                     "payment_hash": hex::encode(hash.0),
                     "amount_msat": claimable_amount_msat,
                     "claim_deadline": claim_deadline,
@@ -2054,7 +2285,7 @@ fn handle_sell(node: &Arc<Node>, tx: &broadcast::Sender<ConsoleEvent>, router: &
                 // Claim payment (reveals preimage to buyer)
                 invoice::claim_payment(node, &key, claimable_amount_msat)
                     .expect("Failed to claim payment");
-                emit(tx, role, "PAYMENT_CLAIMED", serde_json::json!({
+                emitter.emit( role, "PAYMENT_CLAIMED", serde_json::json!({
                     "preimage": hex::encode(key),
                     "message": "Preimage revealed to buyer via HTLC settlement",
                 }));
@@ -2064,7 +2295,7 @@ fn handle_sell(node: &Arc<Node>, tx: &broadcast::Sender<ConsoleEvent>, router: &
                 amount_msat,
                 ..
             } => {
-                emit(tx, role, "PAYMENT_RECEIVED", serde_json::json!({
+                emitter.emit( role, "PAYMENT_RECEIVED", serde_json::json!({
                     "payment_hash": hex::encode(hash.0),
                     "amount_msat": amount_msat,
                     "message": "Payment confirmed. Content sold.",
@@ -2116,7 +2347,7 @@ fn parse_chunks_arg(arg: &Option<String>, total_chunks: usize) -> Vec<usize> {
 // ---------------------------------------------------------------------------
 
 fn handle_seed(
-    tx: &broadcast::Sender<ConsoleEvent>,
+    emitter: &ConsoleEmitter,
     storage_dir: &str,
     catalog: &Arc<std::sync::Mutex<Vec<CatalogEntry>>>,
     enc_file_path: &str,
@@ -2135,7 +2366,7 @@ fn handle_seed(
     let enc_hash = verify::sha256_hash(&encrypted);
     let expected_enc_hash = hex::decode(expected_enc_hash_hex).expect("Invalid hex hash");
     if enc_hash[..] != expected_enc_hash[..] {
-        emit(tx, role, "ENC_HASH_MISMATCH", serde_json::json!({
+        emitter.emit( role, "ENC_HASH_MISMATCH", serde_json::json!({
             "expected": expected_enc_hash_hex,
             "actual": hex::encode(enc_hash),
             "message": "Encrypted content hash mismatch! File may be corrupted.",
@@ -2143,7 +2374,7 @@ fn handle_seed(
         eprintln!("ERROR: Encrypted content hash mismatch");
         return;
     }
-    emit(tx, role, "ENC_HASH_VERIFIED", serde_json::json!({
+    emitter.emit( role, "ENC_HASH_VERIFIED", serde_json::json!({
         "hash": hex::encode(enc_hash),
     }));
 
@@ -2151,7 +2382,7 @@ fn handle_seed(
     {
         let cat = catalog.lock().unwrap();
         if cat.iter().any(|e| e.encrypted_hash == expected_enc_hash_hex) {
-            emit(tx, role, "ALREADY_SEEDED", serde_json::json!({
+            emitter.emit( role, "ALREADY_SEEDED", serde_json::json!({
                 "encrypted_hash": expected_enc_hash_hex,
                 "message": "Content already in seeder catalog",
             }));
@@ -2171,7 +2402,7 @@ fn handle_seed(
     // 4c. Parse --chunks argument (e.g. "0,1,2,5-9")
     let chunks_held = parse_chunks_arg(chunks_arg, meta.count);
     if !chunks_held.is_empty() {
-        emit(tx, role, "CHUNKS_SELECTED", serde_json::json!({
+        emitter.emit( role, "CHUNKS_SELECTED", serde_json::json!({
             "chunks_held": &chunks_held,
             "total_chunks": meta.count,
             "message": format!("Seeding {} of {} chunks", chunks_held.len(), meta.count),
@@ -2212,7 +2443,7 @@ fn handle_seed(
     }
 
     let chunks_seeding = if chunks_held.is_empty() { meta.count } else { chunks_held.len() };
-    emit(tx, role, "CONTENT_SEEDED", serde_json::json!({
+    emitter.emit( role, "CONTENT_SEEDED", serde_json::json!({
         "encrypted_hash": expected_enc_hash_hex,
         "file_name": &file_name,
         "transport_price": transport_price,
@@ -2249,7 +2480,7 @@ fn handle_seed(
 // ---------------------------------------------------------------------------
 
 fn handle_register(
-    tx: &broadcast::Sender<ConsoleEvent>,
+    emitter: &ConsoleEmitter,
     storage_dir: &str,
     catalog: &Arc<std::sync::Mutex<Vec<CatalogEntry>>>,
     file_path: &str,
@@ -2265,7 +2496,7 @@ fn handle_register(
 
     // 2. Compute content hash H(F)
     let content_hash = hex::encode(verify::sha256_hash(&plaintext));
-    emit(tx, role, "HASH_COMPUTED", serde_json::json!({
+    emitter.emit( role, "HASH_COMPUTED", serde_json::json!({
         "hash": &content_hash,
         "file_name": &file_name,
     }));
@@ -2275,7 +2506,7 @@ fn handle_register(
         let cat = catalog.lock().unwrap();
         if let Some(existing) = cat.iter().find(|e| e.content_hash == content_hash) {
             println!("Content already registered: {} ({})", file_name, content_hash);
-            emit(tx, role, "ALREADY_REGISTERED", serde_json::json!({
+            emitter.emit( role, "ALREADY_REGISTERED", serde_json::json!({
                 "content_hash": &content_hash,
                 "file_name": &file_name,
                 "price_sats": existing.price_sats,
@@ -2286,7 +2517,7 @@ fn handle_register(
 
     // 4. Generate content key K (permanent, reused for every buyer)
     let key = encrypt::generate_key();
-    emit(tx, role, "KEY_GENERATED", serde_json::json!({
+    emitter.emit( role, "KEY_GENERATED", serde_json::json!({
         "key": hex::encode(key),
         "message": "Content key K generated — stored in catalog, reused for every buyer",
     }));
@@ -2317,7 +2548,7 @@ fn handle_register(
     // Flat hashes remain for backward compat and seeder lookup
     let encrypted_hash = hex::encode(verify::sha256_hash(&ciphertext));
 
-    emit(tx, role, "CONTENT_ENCRYPTED", serde_json::json!({
+    emitter.emit( role, "CONTENT_ENCRYPTED", serde_json::json!({
         "plaintext_bytes": size_bytes,
         "ciphertext_bytes": ciphertext.len(),
         "enc_path": &enc_path,
@@ -2358,7 +2589,7 @@ fn handle_register(
         save_catalog(storage_dir, &cat);
     }
 
-    emit(tx, role, "CONTENT_REGISTERED", serde_json::json!({
+    emitter.emit( role, "CONTENT_REGISTERED", serde_json::json!({
         "content_hash": &content_hash,
         "file_name": &file_name,
         "encrypted_hash": &encrypted_hash,
@@ -2416,13 +2647,13 @@ fn handle_register(
 
 fn handle_sell_from_catalog(
     node: &Arc<Node>,
-    tx: &broadcast::Sender<ConsoleEvent>,
+    emitter: &ConsoleEmitter,
     router: &Arc<EventRouter>,
     key: &[u8; 32],
 ) {
     let role = "creator";
 
-    emit(tx, role, "WAITING_FOR_PAYMENT", serde_json::json!({
+    emitter.emit( role, "WAITING_FOR_PAYMENT", serde_json::json!({
         "message": "Listening for incoming HTLC..."
     }));
 
@@ -2438,7 +2669,7 @@ fn handle_sell_from_catalog(
                 claim_deadline,
                 ..
             } => {
-                emit(tx, role, "HTLC_RECEIVED", serde_json::json!({
+                emitter.emit( role, "HTLC_RECEIVED", serde_json::json!({
                     "payment_hash": hex::encode(hash.0),
                     "amount_msat": claimable_amount_msat,
                     "claim_deadline": claim_deadline,
@@ -2446,7 +2677,7 @@ fn handle_sell_from_catalog(
 
                 invoice::claim_payment(node, key, claimable_amount_msat)
                     .expect("Failed to claim payment");
-                emit(tx, role, "PAYMENT_CLAIMED", serde_json::json!({
+                emitter.emit( role, "PAYMENT_CLAIMED", serde_json::json!({
                     "preimage": hex::encode(key),
                     "message": "Preimage revealed to buyer via HTLC settlement",
                 }));
@@ -2456,7 +2687,7 @@ fn handle_sell_from_catalog(
                 amount_msat,
                 ..
             } => {
-                emit(tx, role, "PAYMENT_RECEIVED", serde_json::json!({
+                emitter.emit( role, "PAYMENT_RECEIVED", serde_json::json!({
                     "payment_hash": hex::encode(hash.0),
                     "amount_msat": amount_msat,
                     "message": "Payment confirmed. Content sold.",
@@ -2487,7 +2718,7 @@ fn handle_sell_from_catalog(
 
 fn handle_ad_sell_hold_and_claim(
     node: &Arc<Node>,
-    tx: &broadcast::Sender<ConsoleEvent>,
+    emitter: &ConsoleEmitter,
     router: &Arc<EventRouter>,
     key_k: &[u8; 32],      // Invoice 1 preimage: content key K
     key_k_ad: &[u8; 32],   // Invoice 2 preimage: random K_ad
@@ -2502,7 +2733,7 @@ fn handle_ad_sell_hold_and_claim(
     let rx_k = router.register(hash_k);
     let rx_k_ad = router.register(hash_k_ad);
 
-    emit(tx, role, "AD_HOLD_WAITING", serde_json::json!({
+    emitter.emit( role, "AD_HOLD_WAITING", serde_json::json!({
         "message": "Waiting for BOTH Invoice 1 (buyer) and Invoice 2 (advertiser) HTLCs before claiming either",
         "buyer_payment_hash": hex::encode(hash_k.0),
         "ad_payment_hash": hex::encode(hash_k_ad.0),
@@ -2519,7 +2750,7 @@ fn handle_ad_sell_hold_and_claim(
         if buyer_htlc.is_none() {
             if let Ok(event) = rx_k.try_recv() {
                 if let Event::PaymentClaimable { claimable_amount_msat, .. } = event {
-                    emit(tx, role, "AD_HTLC_BUYER_ARRIVED", serde_json::json!({
+                    emitter.emit( role, "AD_HTLC_BUYER_ARRIVED", serde_json::json!({
                         "payment_hash": hex::encode(hash_k.0),
                         "amount_msat": claimable_amount_msat,
                         "message": "Buyer's HTLC arrived — HOLDING until advertiser's HTLC also arrives",
@@ -2533,7 +2764,7 @@ fn handle_ad_sell_hold_and_claim(
         if ad_htlc.is_none() {
             if let Ok(event) = rx_k_ad.try_recv() {
                 if let Event::PaymentClaimable { claimable_amount_msat, .. } = event {
-                    emit(tx, role, "AD_HTLC_ADVERTISER_ARRIVED", serde_json::json!({
+                    emitter.emit( role, "AD_HTLC_ADVERTISER_ARRIVED", serde_json::json!({
                         "payment_hash": hex::encode(hash_k_ad.0),
                         "amount_msat": claimable_amount_msat,
                         "message": "Advertiser's HTLC arrived — HOLDING until buyer's HTLC also arrives",
@@ -2545,7 +2776,7 @@ fn handle_ad_sell_hold_and_claim(
 
         // If BOTH have arrived, claim both and break
         if let (Some(buyer_amt), Some(ad_amt)) = (buyer_htlc, ad_htlc) {
-            emit(tx, role, "AD_BOTH_HTLCS_READY", serde_json::json!({
+            emitter.emit( role, "AD_BOTH_HTLCS_READY", serde_json::json!({
                 "message": "BOTH HTLCs arrived — claiming both now",
                 "buyer_amount_msat": buyer_amt,
                 "ad_amount_msat": ad_amt,
@@ -2556,7 +2787,7 @@ fn handle_ad_sell_hold_and_claim(
             // the advertiser's payment first is a nice convention.
             invoice::claim_payment(node, key_k_ad, ad_amt)
                 .expect("Failed to claim advertiser payment");
-            emit(tx, role, "AD_CLAIMED_ADVERTISER", serde_json::json!({
+            emitter.emit( role, "AD_CLAIMED_ADVERTISER", serde_json::json!({
                 "preimage": hex::encode(key_k_ad),
                 "amount_msat": ad_amt,
                 "message": "Advertiser payment claimed (K_ad revealed — meaningless)",
@@ -2565,7 +2796,7 @@ fn handle_ad_sell_hold_and_claim(
             // Claim Invoice 1 (K, the content key) — buyer learns K
             invoice::claim_payment(node, key_k, buyer_amt)
                 .expect("Failed to claim buyer payment");
-            emit(tx, role, "AD_CLAIMED_BUYER", serde_json::json!({
+            emitter.emit( role, "AD_CLAIMED_BUYER", serde_json::json!({
                 "preimage": hex::encode(key_k),
                 "amount_msat": buyer_amt,
                 "message": "Buyer payment claimed (K revealed — buyer can now decrypt content)",
@@ -2584,7 +2815,7 @@ fn handle_ad_sell_hold_and_claim(
     while !k_confirmed || !k_ad_confirmed {
         if !k_confirmed {
             if let Ok(Event::PaymentReceived { amount_msat, .. }) = rx_k.try_recv() {
-                emit(tx, role, "AD_PAYMENT_CONFIRMED_BUYER", serde_json::json!({
+                emitter.emit( role, "AD_PAYMENT_CONFIRMED_BUYER", serde_json::json!({
                     "amount_msat": amount_msat,
                     "message": "Buyer payment fully settled",
                 }));
@@ -2593,7 +2824,7 @@ fn handle_ad_sell_hold_and_claim(
         }
         if !k_ad_confirmed {
             if let Ok(Event::PaymentReceived { amount_msat, .. }) = rx_k_ad.try_recv() {
-                emit(tx, role, "AD_PAYMENT_CONFIRMED_ADVERTISER", serde_json::json!({
+                emitter.emit( role, "AD_PAYMENT_CONFIRMED_ADVERTISER", serde_json::json!({
                     "amount_msat": amount_msat,
                     "message": "Advertiser payment fully settled",
                 }));
@@ -2605,7 +2836,7 @@ fn handle_ad_sell_hold_and_claim(
         }
     }
 
-    emit(tx, role, "AD_SALE_COMPLETE", serde_json::json!({
+    emitter.emit( role, "AD_SALE_COMPLETE", serde_json::json!({
         "message": "Ad-subsidized sale complete — both payments settled trustlessly",
     }));
 
@@ -2623,7 +2854,7 @@ fn handle_ad_sell_hold_and_claim(
 
 fn handle_buy_two_phase(
     node: &Arc<Node>,
-    tx: &broadcast::Sender<ConsoleEvent>,
+    emitter: &ConsoleEmitter,
     router: &Arc<EventRouter>,
     req: &BuyRequest,
 ) {
@@ -2641,7 +2872,7 @@ fn handle_buy_two_phase(
 
     // 1. Countdown
     for i in (1..=3).rev() {
-        emit(tx, role, "COUNTDOWN", serde_json::json!({
+        emitter.emit( role, "COUNTDOWN", serde_json::json!({
             "seconds": i,
             "message": format!("Paying creator in {}...", i),
         }));
@@ -2660,7 +2891,7 @@ fn handle_buy_two_phase(
         arr
     };
 
-    emit(tx, role, "CONTENT_PAYING", serde_json::json!({
+    emitter.emit( role, "CONTENT_PAYING", serde_json::json!({
         "bolt11": content_invoice,
         "message": "Paying creator for content key K...",
     }));
@@ -2670,7 +2901,7 @@ fn handle_buy_two_phase(
     match invoice::pay_invoice(node, content_invoice) {
         Ok(hash_bytes_k) => {
             let target_hash_k = PaymentHash(hash_bytes_k);
-            emit(tx, role, "CONTENT_PAYMENT_SENT", serde_json::json!({
+            emitter.emit( role, "CONTENT_PAYMENT_SENT", serde_json::json!({
                 "payment_hash": hex::encode(hash_bytes_k),
             }));
 
@@ -2686,7 +2917,7 @@ fn handle_buy_two_phase(
                         ..
                     } => {
                         key = preimage.0;
-                        emit(tx, role, "CONTENT_PAID", serde_json::json!({
+                        emitter.emit( role, "CONTENT_PAID", serde_json::json!({
                             "payment_hash": hex::encode(payment_hash.0),
                             "preimage_k": hex::encode(key),
                             "fee_msat": fee_paid_msat,
@@ -2698,7 +2929,7 @@ fn handle_buy_two_phase(
                         reason,
                         ..
                     } => {
-                        emit(tx, role, "CONTENT_PAYMENT_FAILED", serde_json::json!({
+                        emitter.emit( role, "CONTENT_PAYMENT_FAILED", serde_json::json!({
                             "payment_hash": hex::encode(target_hash_k.0),
                             "reason": format!("{:?}", reason),
                             "message": "Content payment failed. No money lost to seeders.",
@@ -2715,7 +2946,7 @@ fn handle_buy_two_phase(
             let err_str = format!("{:?}", e);
             if err_str.contains("DuplicatePayment") {
                 // Already paid for this content key K — look it up from payment history
-                emit(tx, role, "CONTENT_ALREADY_PAID", serde_json::json!({
+                emitter.emit( role, "CONTENT_ALREADY_PAID", serde_json::json!({
                     "message": "Already paid for content key K. Looking up from payment history...",
                 }));
 
@@ -2736,20 +2967,20 @@ fn handle_buy_two_phase(
                 match found_key {
                     Some(k) => {
                         key = k;
-                        emit(tx, role, "CONTENT_PAID", serde_json::json!({
+                        emitter.emit( role, "CONTENT_PAID", serde_json::json!({
                             "preimage_k": hex::encode(key),
                             "message": "Content key K recovered from payment history. Skipping to seeder phase.",
                         }));
                     }
                     None => {
-                        emit(tx, role, "CONTENT_PAYMENT_FAILED", serde_json::json!({
+                        emitter.emit( role, "CONTENT_PAYMENT_FAILED", serde_json::json!({
                             "message": "DuplicatePayment but could not find preimage in history. Cannot proceed.",
                         }));
                         return;
                     }
                 }
             } else {
-                emit(tx, role, "CONTENT_PAYMENT_FAILED", serde_json::json!({
+                emitter.emit( role, "CONTENT_PAYMENT_FAILED", serde_json::json!({
                     "error": err_str,
                     "message": "Content payment failed.",
                 }));
@@ -2767,12 +2998,12 @@ fn handle_buy_two_phase(
 
     // 3. Fetch wrapped file W from seeder
     let wrapped_path = if let Some(ref url) = req.wrapped_url {
-        match curl_fetch(url, tx) {
+        match curl_fetch(url, emitter) {
             Some(path) => path,
             None => return,
         }
     } else {
-        emit(tx, role, "BUY_ERROR", serde_json::json!({
+        emitter.emit( role, "BUY_ERROR", serde_json::json!({
             "message": "No wrapped_url provided for two-phase buy",
         }));
         return;
@@ -2780,14 +3011,14 @@ fn handle_buy_two_phase(
     let wrapped = std::fs::read(&wrapped_path).expect("Failed to read wrapped file");
 
     // 4. Pay transport invoice -> get K_S
-    emit(tx, role, "TRANSPORT_PAYING", serde_json::json!({
+    emitter.emit( role, "TRANSPORT_PAYING", serde_json::json!({
         "bolt11": transport_invoice,
         "message": "Paying seeder for transport key K_S...",
     }));
     let hash_bytes_ks = invoice::pay_invoice(node, transport_invoice)
         .expect("Failed to pay transport invoice");
     let target_hash_ks = PaymentHash(hash_bytes_ks);
-    emit(tx, role, "TRANSPORT_PAYMENT_SENT", serde_json::json!({
+    emitter.emit( role, "TRANSPORT_PAYMENT_SENT", serde_json::json!({
         "payment_hash": hex::encode(hash_bytes_ks),
     }));
 
@@ -2804,7 +3035,7 @@ fn handle_buy_two_phase(
                 ..
             } => {
                 ks = preimage.0;
-                emit(tx, role, "TRANSPORT_PAID", serde_json::json!({
+                emitter.emit( role, "TRANSPORT_PAID", serde_json::json!({
                     "payment_hash": hex::encode(payment_hash.0),
                     "preimage_ks": hex::encode(ks),
                     "fee_msat": fee_paid_msat,
@@ -2816,7 +3047,7 @@ fn handle_buy_two_phase(
                 reason,
                 ..
             } => {
-                emit(tx, role, "TRANSPORT_PAYMENT_FAILED", serde_json::json!({
+                emitter.emit( role, "TRANSPORT_PAYMENT_FAILED", serde_json::json!({
                     "payment_hash": hex::encode(target_hash_ks.0),
                     "reason": format!("{:?}", reason),
                     "message": "Transport payment failed. You still have K — try another seeder.",
@@ -2831,7 +3062,7 @@ fn handle_buy_two_phase(
 
     // 5. Unwrap: E = Dec(W, K_S)
     let encrypted = encrypt::decrypt(&wrapped, &ks, 0);
-    emit(tx, role, "CONTENT_UNWRAPPED", serde_json::json!({
+    emitter.emit( role, "CONTENT_UNWRAPPED", serde_json::json!({
         "wrapped_bytes": wrapped.len(),
         "encrypted_bytes": encrypted.len(),
         "key_ks": hex::encode(ks),
@@ -2843,13 +3074,13 @@ fn handle_buy_two_phase(
         let enc_hash = verify::sha256_hash(&encrypted);
         let expected_bytes = hex::decode(enc_hash_hex).unwrap_or_default();
         let matches = enc_hash[..] == expected_bytes[..];
-        emit(tx, role, "ENCRYPTED_HASH_VERIFIED", serde_json::json!({
+        emitter.emit( role, "ENCRYPTED_HASH_VERIFIED", serde_json::json!({
             "matches": matches,
             "expected": enc_hash_hex,
             "actual": hex::encode(enc_hash),
         }));
         if !matches {
-            emit(tx, role, "ENCRYPTED_HASH_MISMATCH", serde_json::json!({
+            emitter.emit( role, "ENCRYPTED_HASH_MISMATCH", serde_json::json!({
                 "expected": enc_hash_hex,
                 "actual": hex::encode(enc_hash),
                 "message": "Encrypted content hash mismatch after unwrap!",
@@ -2867,7 +3098,7 @@ fn handle_buy_two_phase(
         .enumerate()
         .flat_map(|(i, c)| encrypt::decrypt(c, &key, i as u64))
         .collect();
-    emit(tx, role, "CONTENT_DECRYPTED", serde_json::json!({
+    emitter.emit( role, "CONTENT_DECRYPTED", serde_json::json!({
         "bytes": plaintext.len(),
         "key": hex::encode(key),
         "chunks": enc_chunks.len(),
@@ -2878,13 +3109,13 @@ fn handle_buy_two_phase(
     let mut expected_hash = [0u8; 32];
     expected_hash.copy_from_slice(&expected_hash_bytes);
     let matches = verify::verify_hash(&plaintext, &expected_hash);
-    emit(tx, role, "HASH_VERIFIED", serde_json::json!({
+    emitter.emit( role, "HASH_VERIFIED", serde_json::json!({
         "matches": matches,
         "expected": &req.hash,
         "actual": hex::encode(verify::sha256_hash(&plaintext)),
     }));
     if !matches {
-        emit(tx, role, "HASH_MISMATCH", serde_json::json!({
+        emitter.emit( role, "HASH_MISMATCH", serde_json::json!({
             "expected": &req.hash,
             "actual": hex::encode(verify::sha256_hash(&plaintext)),
             "message": "Content hash mismatch!",
@@ -2894,7 +3125,7 @@ fn handle_buy_two_phase(
 
     // 9. Save
     std::fs::write(&req.output, &plaintext).expect("Failed to write decrypted file");
-    emit(tx, role, "FILE_SAVED", serde_json::json!({
+    emitter.emit( role, "FILE_SAVED", serde_json::json!({
         "path": &req.output,
         "bytes": plaintext.len(),
         "message": "Two-phase atomic content exchange complete.",
@@ -2964,7 +3195,7 @@ fn plan_chunk_assignments(
 
 fn handle_buy_chunked(
     node: &Arc<Node>,
-    tx: &broadcast::Sender<ConsoleEvent>,
+    emitter: &ConsoleEmitter,
     router: &Arc<EventRouter>,
     req: &BuyRequest,
 ) {
@@ -2972,7 +3203,7 @@ fn handle_buy_chunked(
     let content_invoice = match req.content_invoice.as_deref() {
         Some(inv) => inv,
         None => {
-            emit(tx, role, "BUY_ERROR", serde_json::json!({
+            emitter.emit( role, "BUY_ERROR", serde_json::json!({
                 "message": "Chunked buy requires content_invoice",
             }));
             return;
@@ -2981,14 +3212,14 @@ fn handle_buy_chunked(
     let enc_hash_hex = match req.encrypted_hash.as_deref() {
         Some(h) => h.to_string(),
         None => {
-            emit(tx, role, "BUY_ERROR", serde_json::json!({
+            emitter.emit( role, "BUY_ERROR", serde_json::json!({
                 "message": "Chunked buy requires encrypted_hash",
             }));
             return;
         }
     };
     if req.seeder_urls.is_empty() {
-        emit(tx, role, "BUY_ERROR", serde_json::json!({
+        emitter.emit( role, "BUY_ERROR", serde_json::json!({
             "message": "Chunked buy requires at least one seeder_url",
         }));
         return;
@@ -2999,7 +3230,7 @@ fn handle_buy_chunked(
     // -----------------------------------------------------------------------
 
     for i in (1..=3).rev() {
-        emit(tx, role, "COUNTDOWN", serde_json::json!({
+        emitter.emit( role, "COUNTDOWN", serde_json::json!({
             "seconds": i,
             "message": format!("Paying creator in {}...", i),
         }));
@@ -3015,7 +3246,7 @@ fn handle_buy_chunked(
         arr
     };
 
-    emit(tx, role, "CONTENT_PAYING", serde_json::json!({
+    emitter.emit( role, "CONTENT_PAYING", serde_json::json!({
         "bolt11": content_invoice,
         "message": "Paying creator for content key K...",
     }));
@@ -3024,7 +3255,7 @@ fn handle_buy_chunked(
     match invoice::pay_invoice(node, content_invoice) {
         Ok(hash_bytes_k) => {
             let target_hash_k = PaymentHash(hash_bytes_k);
-            emit(tx, role, "CONTENT_PAYMENT_SENT", serde_json::json!({
+            emitter.emit( role, "CONTENT_PAYMENT_SENT", serde_json::json!({
                 "payment_hash": hex::encode(hash_bytes_k),
             }));
             let rx = router.register(target_hash_k);
@@ -3037,7 +3268,7 @@ fn handle_buy_chunked(
                         ..
                     } => {
                         key = preimage.0;
-                        emit(tx, role, "CONTENT_PAID", serde_json::json!({
+                        emitter.emit( role, "CONTENT_PAID", serde_json::json!({
                             "preimage_k": hex::encode(key),
                             "fee_msat": fee_paid_msat,
                             "message": "Content key K received!",
@@ -3045,7 +3276,7 @@ fn handle_buy_chunked(
                         break;
                     }
                     Event::PaymentFailed { reason, .. } => {
-                        emit(tx, role, "CONTENT_PAYMENT_FAILED", serde_json::json!({
+                        emitter.emit( role, "CONTENT_PAYMENT_FAILED", serde_json::json!({
                             "reason": format!("{:?}", reason),
                             "message": "Content payment failed.",
                         }));
@@ -3060,7 +3291,7 @@ fn handle_buy_chunked(
         Err(e) => {
             let err_str = format!("{:?}", e);
             if err_str.contains("DuplicatePayment") {
-                emit(tx, role, "CONTENT_ALREADY_PAID", serde_json::json!({
+                emitter.emit( role, "CONTENT_ALREADY_PAID", serde_json::json!({
                     "message": "Already paid for content key K. Looking up from payment history...",
                 }));
                 let target = PaymentHash(content_payment_hash);
@@ -3079,26 +3310,26 @@ fn handle_buy_chunked(
                     Some(p) => {
                         if let PaymentKind::Bolt11 { preimage: Some(pre), .. } = &p.kind {
                             key = pre.0;
-                            emit(tx, role, "CONTENT_PAID", serde_json::json!({
+                            emitter.emit( role, "CONTENT_PAID", serde_json::json!({
                                 "preimage_k": hex::encode(key),
                                 "message": "Recovered K from payment history.",
                             }));
                         } else {
-                            emit(tx, role, "CONTENT_PAYMENT_FAILED", serde_json::json!({
+                            emitter.emit( role, "CONTENT_PAYMENT_FAILED", serde_json::json!({
                                 "message": "Found payment but no preimage.",
                             }));
                             return;
                         }
                     }
                     None => {
-                        emit(tx, role, "CONTENT_PAYMENT_FAILED", serde_json::json!({
+                        emitter.emit( role, "CONTENT_PAYMENT_FAILED", serde_json::json!({
                             "message": "DuplicatePayment but preimage not found in history.",
                         }));
                         return;
                     }
                 }
             } else {
-                emit(tx, role, "CONTENT_PAYMENT_FAILED", serde_json::json!({
+                emitter.emit( role, "CONTENT_PAYMENT_FAILED", serde_json::json!({
                     "error": err_str,
                     "message": "Content payment failed.",
                 }));
@@ -3116,7 +3347,7 @@ fn handle_buy_chunked(
     let meta: serde_json::Value = match client.get(&meta_url).send().and_then(|r| r.json()) {
         Ok(m) => m,
         Err(e) => {
-            emit(tx, role, "BUY_ERROR", serde_json::json!({
+            emitter.emit( role, "BUY_ERROR", serde_json::json!({
                 "message": format!("Failed to fetch chunk metadata: {}", e),
             }));
             return;
@@ -3127,7 +3358,7 @@ fn handle_buy_chunked(
     let chunk_size = meta["chunk_size"].as_u64().unwrap_or(0) as usize;
     let encrypted_root = meta["encrypted_root"].as_str().unwrap_or("").to_string();
 
-    emit(tx, role, "CHUNK_META_RECEIVED", serde_json::json!({
+    emitter.emit( role, "CHUNK_META_RECEIVED", serde_json::json!({
         "chunk_count": chunk_count,
         "chunk_size": chunk_size,
         "encrypted_root": &encrypted_root,
@@ -3135,7 +3366,7 @@ fn handle_buy_chunked(
     }));
 
     if chunk_count == 0 {
-        emit(tx, role, "BUY_ERROR", serde_json::json!({
+        emitter.emit( role, "BUY_ERROR", serde_json::json!({
             "message": "chunk_count is 0 — content has no chunks",
         }));
         return;
@@ -3155,7 +3386,7 @@ fn handle_buy_chunked(
                     .as_array()
                     .map(|arr| arr.iter().map(|v| v.as_bool().unwrap_or(false)).collect())
                     .unwrap_or_default();
-                emit(tx, role, "BITFIELD_RECEIVED", serde_json::json!({
+                emitter.emit( role, "BITFIELD_RECEIVED", serde_json::json!({
                     "seeder": url,
                     "chunks_available": bits.iter().filter(|&&b| b).count(),
                     "total": chunk_count,
@@ -3163,7 +3394,7 @@ fn handle_buy_chunked(
                 seeder_bitfields.push(bits);
             }
             Err(e) => {
-                emit(tx, role, "BITFIELD_FAILED", serde_json::json!({
+                emitter.emit( role, "BITFIELD_FAILED", serde_json::json!({
                     "seeder": url,
                     "error": format!("{}", e),
                 }));
@@ -3178,7 +3409,7 @@ fn handle_buy_chunked(
     // Check for unassignable chunks (no seeder has them)
     for &ci in &download_order {
         if assignments[ci].is_none() {
-            emit(tx, role, "BUY_ERROR", serde_json::json!({
+            emitter.emit( role, "BUY_ERROR", serde_json::json!({
                 "message": format!("No seeder has chunk {}!", ci),
                 "chunk_index": ci,
             }));
@@ -3199,7 +3430,7 @@ fn handle_buy_chunked(
         *rarity_histogram.entry(r).or_insert(0) += 1;
     }
 
-    emit(tx, role, "CHUNK_PLAN", serde_json::json!({
+    emitter.emit( role, "CHUNK_PLAN", serde_json::json!({
         "assignments": assignments.iter().map(|a| a.unwrap_or(0)).collect::<Vec<_>>(),
         "download_order": download_order,
         "rarity_histogram": rarity_histogram,
@@ -3252,7 +3483,7 @@ fn handle_buy_chunked(
         match client.post(&url).json(&body).send().and_then(|r| r.json::<serde_json::Value>()) {
             Ok(resp) => {
                 let bolt11 = resp["bolt11"].as_str().unwrap_or("").to_string();
-                emit(tx, role, "TRANSPORT_INVOICE_RECEIVED", serde_json::json!({
+                emitter.emit( role, "TRANSPORT_INVOICE_RECEIVED", serde_json::json!({
                     "seeder": &req.seeder_urls[si],
                     "bolt11": &bolt11,
                     "chunks": chunks,
@@ -3266,7 +3497,7 @@ fn handle_buy_chunked(
                 });
             }
             Err(e) => {
-                emit(tx, role, "BUY_ERROR", serde_json::json!({
+                emitter.emit( role, "BUY_ERROR", serde_json::json!({
                     "message": format!("Failed to get transport invoice from seeder {}: {}", si, e),
                 }));
                 return;
@@ -3279,7 +3510,7 @@ fn handle_buy_chunked(
     // -----------------------------------------------------------------------
 
     for transport in &mut transports {
-        emit(tx, role, "TRANSPORT_PAYING", serde_json::json!({
+        emitter.emit( role, "TRANSPORT_PAYING", serde_json::json!({
             "seeder": &req.seeder_urls[transport.seeder_index],
             "bolt11": &transport.bolt11,
             "chunks": &transport.chunks,
@@ -3298,7 +3529,7 @@ fn handle_buy_chunked(
                             ..
                         } => {
                             transport.ks = Some(preimage.0);
-                            emit(tx, role, "TRANSPORT_PAID", serde_json::json!({
+                            emitter.emit( role, "TRANSPORT_PAID", serde_json::json!({
                                 "seeder": &req.seeder_urls[transport.seeder_index],
                                 "preimage_ks": hex::encode(preimage.0),
                                 "fee_msat": fee_paid_msat,
@@ -3307,7 +3538,7 @@ fn handle_buy_chunked(
                             break;
                         }
                         Event::PaymentFailed { reason, .. } => {
-                            emit(tx, role, "TRANSPORT_PAYMENT_FAILED", serde_json::json!({
+                            emitter.emit( role, "TRANSPORT_PAYMENT_FAILED", serde_json::json!({
                                 "seeder": &req.seeder_urls[transport.seeder_index],
                                 "reason": format!("{:?}", reason),
                                 "message": "Transport payment failed for this seeder.",
@@ -3321,7 +3552,7 @@ fn handle_buy_chunked(
                 router.unregister(&target_hash_ks);
             }
             Err(e) => {
-                emit(tx, role, "TRANSPORT_PAYMENT_FAILED", serde_json::json!({
+                emitter.emit( role, "TRANSPORT_PAYMENT_FAILED", serde_json::json!({
                     "seeder": &req.seeder_urls[transport.seeder_index],
                     "error": format!("{:?}", e),
                 }));
@@ -3348,7 +3579,7 @@ fn handle_buy_chunked(
             let wrapped_chunk = match client.get(&wc_url).send().and_then(|r| r.bytes()) {
                 Ok(b) => b.to_vec(),
                 Err(e) => {
-                    emit(tx, role, "CHUNK_DOWNLOAD_FAILED", serde_json::json!({
+                    emitter.emit( role, "CHUNK_DOWNLOAD_FAILED", serde_json::json!({
                         "chunk_index": ci,
                         "seeder": &req.seeder_urls[transport.seeder_index],
                         "error": format!("{}", e),
@@ -3374,12 +3605,12 @@ fn handle_buy_chunked(
                                 root.copy_from_slice(&root_bytes);
                             }
                             if proof.verify(&enc_chunk, ci, &root) {
-                                emit(tx, role, "CHUNK_VERIFIED", serde_json::json!({
+                                emitter.emit( role, "CHUNK_VERIFIED", serde_json::json!({
                                     "chunk_index": ci,
                                     "message": format!("Chunk {} Merkle proof verified", ci),
                                 }));
                             } else {
-                                emit(tx, role, "CHUNK_VERIFICATION_FAILED", serde_json::json!({
+                                emitter.emit( role, "CHUNK_VERIFICATION_FAILED", serde_json::json!({
                                     "chunk_index": ci,
                                     "message": format!("Chunk {} Merkle proof FAILED — seeder sent bad data!", ci),
                                 }));
@@ -3389,7 +3620,7 @@ fn handle_buy_chunked(
                     }
                 }
                 Err(e) => {
-                    emit(tx, role, "CHUNK_PROOF_FETCH_FAILED", serde_json::json!({
+                    emitter.emit( role, "CHUNK_PROOF_FETCH_FAILED", serde_json::json!({
                         "chunk_index": ci,
                         "error": format!("{}", e),
                         "message": "Proof fetch failed — continuing without verification",
@@ -3398,7 +3629,7 @@ fn handle_buy_chunked(
             }
 
             enc_chunks[ci] = Some(enc_chunk);
-            emit(tx, role, "CHUNK_DOWNLOADED", serde_json::json!({
+            emitter.emit( role, "CHUNK_DOWNLOADED", serde_json::json!({
                 "chunk_index": ci,
                 "total": chunk_count,
                 "progress": format!("{}/{}", enc_chunks.iter().filter(|c| c.is_some()).count(), chunk_count),
@@ -3413,7 +3644,7 @@ fn handle_buy_chunked(
     // Check all chunks received
     for (ci, chunk) in enc_chunks.iter().enumerate() {
         if chunk.is_none() {
-            emit(tx, role, "BUY_ERROR", serde_json::json!({
+            emitter.emit( role, "BUY_ERROR", serde_json::json!({
                 "message": format!("Missing encrypted chunk {}", ci),
             }));
             return;
@@ -3428,7 +3659,7 @@ fn handle_buy_chunked(
         plaintext_chunks.push(pt_chunk);
     }
 
-    emit(tx, role, "CHUNKS_DECRYPTED", serde_json::json!({
+    emitter.emit( role, "CHUNKS_DECRYPTED", serde_json::json!({
         "chunk_count": chunk_count,
         "message": format!("All {} chunks decrypted with K", chunk_count),
     }));
@@ -3444,7 +3675,7 @@ fn handle_buy_chunked(
         plaintext.truncate(original_size);
     }
 
-    emit(tx, role, "CONTENT_REASSEMBLED", serde_json::json!({
+    emitter.emit( role, "CONTENT_REASSEMBLED", serde_json::json!({
         "bytes": plaintext.len(),
         "chunks": chunk_count,
     }));
@@ -3453,13 +3684,13 @@ fn handle_buy_chunked(
     let expected_hash_bytes = hex::decode(&req.hash).unwrap_or_default();
     let actual_hash = verify::sha256_hash(&plaintext);
     let matches = expected_hash_bytes.len() == 32 && actual_hash[..] == expected_hash_bytes[..];
-    emit(tx, role, "HASH_VERIFIED", serde_json::json!({
+    emitter.emit( role, "HASH_VERIFIED", serde_json::json!({
         "matches": matches,
         "expected": &req.hash,
         "actual": hex::encode(actual_hash),
     }));
     if !matches {
-        emit(tx, role, "HASH_MISMATCH", serde_json::json!({
+        emitter.emit( role, "HASH_MISMATCH", serde_json::json!({
             "expected": &req.hash,
             "actual": hex::encode(actual_hash),
             "message": "Content hash mismatch after reassembly!",
@@ -3469,7 +3700,7 @@ fn handle_buy_chunked(
 
     // Save
     std::fs::write(&req.output, &plaintext).expect("Failed to write decrypted file");
-    emit(tx, role, "FILE_SAVED", serde_json::json!({
+    emitter.emit( role, "FILE_SAVED", serde_json::json!({
         "path": &req.output,
         "bytes": plaintext.len(),
         "chunks": chunk_count,
@@ -3488,7 +3719,7 @@ fn handle_buy_chunked(
 
 fn handle_buy(
     node: &Arc<Node>,
-    tx: &broadcast::Sender<ConsoleEvent>,
+    emitter: &ConsoleEmitter,
     router: &Arc<EventRouter>,
     bolt11_str: &str,
     enc_file_path: &str,
@@ -3509,7 +3740,7 @@ fn handle_buy(
 
     // 3. Countdown — give the browser SSE time to connect
     for i in (1..=5).rev() {
-        emit(tx, role, "COUNTDOWN", serde_json::json!({
+        emitter.emit( role, "COUNTDOWN", serde_json::json!({
             "seconds": i,
             "message": format!("Paying in {}...", i),
         }));
@@ -3517,12 +3748,12 @@ fn handle_buy(
     }
 
     // 4. Pay invoice
-    emit(tx, role, "PAYING_INVOICE", serde_json::json!({
+    emitter.emit( role, "PAYING_INVOICE", serde_json::json!({
         "bolt11": bolt11_str,
     }));
     let hash_bytes = invoice::pay_invoice(node, bolt11_str).expect("Failed to pay invoice");
     let target_hash = PaymentHash(hash_bytes);
-    emit(tx, role, "PAYMENT_SENT", serde_json::json!({
+    emitter.emit( role, "PAYMENT_SENT", serde_json::json!({
         "payment_hash": hex::encode(hash_bytes),
         "message": "HTLC in flight, routing to creator...",
     }));
@@ -3540,7 +3771,7 @@ fn handle_buy(
                 ..
             } => {
                 preimage_bytes = preimage.0;
-                emit(tx, role, "PAYMENT_CONFIRMED", serde_json::json!({
+                emitter.emit( role, "PAYMENT_CONFIRMED", serde_json::json!({
                     "payment_hash": hex::encode(payment_hash.0),
                     "preimage": hex::encode(preimage_bytes),
                     "fee_msat": fee_paid_msat,
@@ -3552,7 +3783,7 @@ fn handle_buy(
                 reason,
                 ..
             } => {
-                emit(tx, role, "PAYMENT_FAILED", serde_json::json!({
+                emitter.emit( role, "PAYMENT_FAILED", serde_json::json!({
                     "payment_hash": hex::encode(target_hash.0),
                     "reason": format!("{:?}", reason),
                 }));
@@ -3572,7 +3803,7 @@ fn handle_buy(
         .enumerate()
         .flat_map(|(i, c)| encrypt::decrypt(c, &preimage_bytes, i as u64))
         .collect();
-    emit(tx, role, "CONTENT_DECRYPTED", serde_json::json!({
+    emitter.emit( role, "CONTENT_DECRYPTED", serde_json::json!({
         "bytes": decrypted.len(),
         "key": hex::encode(preimage_bytes),
         "chunks": enc_chunks.len(),
@@ -3580,13 +3811,13 @@ fn handle_buy(
 
     // 6. Verify
     let matches = verify::verify_hash(&decrypted, &expected_hash);
-    emit(tx, role, "HASH_VERIFIED", serde_json::json!({
+    emitter.emit( role, "HASH_VERIFIED", serde_json::json!({
         "matches": matches,
         "expected": expected_hash_hex,
         "actual": hex::encode(verify::sha256_hash(&decrypted)),
     }));
     if !matches {
-        emit(tx, role, "HASH_MISMATCH", serde_json::json!({
+        emitter.emit( role, "HASH_MISMATCH", serde_json::json!({
             "expected": expected_hash_hex,
             "actual": hex::encode(verify::sha256_hash(&decrypted)),
             "message": "Content hash mismatch! File may be corrupted or the wrong .enc was used.",
@@ -3598,7 +3829,7 @@ fn handle_buy(
 
     // 7. Write output
     std::fs::write(output_path, &decrypted).expect("Failed to write decrypted file");
-    emit(tx, role, "FILE_SAVED", serde_json::json!({
+    emitter.emit( role, "FILE_SAVED", serde_json::json!({
         "path": output_path,
         "bytes": decrypted.len(),
         "message": "Atomic content exchange complete.",
@@ -3779,8 +4010,18 @@ fn main() {
     // Create broadcast channel for console events
     let (events_tx, _) = broadcast::channel::<ConsoleEvent>(256);
 
+    // Persistent event log (optional; fall back to broadcast-only if e.g. read-only fs)
+    let event_log = match EventLog::new(&config.storage_dir) {
+        Ok(log) => Some(Arc::new(log)),
+        Err(e) => {
+            eprintln!("Warning: event log disabled ({}), events will not persist", e);
+            None
+        }
+    };
+    let emitter = Arc::new(ConsoleEmitter::new(events_tx, event_log));
+
     // Create event router and start background event loop
-    let event_router = Arc::new(EventRouter::new(events_tx.clone()));
+    let event_router = Arc::new(EventRouter::new(emitter.clone()));
     {
         let router = event_router.clone();
         let node_for_router = node.clone();
@@ -3896,7 +4137,7 @@ fn main() {
 
         let state = AppState {
             node: node.clone(),
-            events_tx: events_tx.clone(),
+            emitter: emitter.clone(),
             event_router: event_router.clone(),
             catalog: catalog.clone(),
             storage_dir: config.storage_dir.clone(),
@@ -3967,7 +4208,7 @@ fn main() {
         }
 
         Commands::Register { file, price } => {
-            handle_register(&events_tx, &config.storage_dir, &catalog, &file, price, &registry_info);
+            handle_register(emitter.as_ref(), &config.storage_dir, &catalog, &file, price, &registry_info);
         }
 
         Commands::Serve => {
@@ -3984,12 +4225,12 @@ fn main() {
             transport_price,
             chunks,
         } => {
-            handle_seed(&events_tx, &config.storage_dir, &catalog, &encrypted_file, &encrypted_hash, transport_price, &registry_info, &chunks);
+            handle_seed(emitter.as_ref(), &config.storage_dir, &catalog, &encrypted_file, &encrypted_hash, transport_price, &registry_info, &chunks);
         }
 
         Commands::Sell { file, price } => {
             event_router.set_role("creator");
-            handle_sell(&node, &events_tx, &event_router, &file, price);
+            handle_sell(&node, emitter.as_ref(), &event_router, &file, price);
         }
 
         Commands::Buy {
@@ -3999,7 +4240,7 @@ fn main() {
             output,
         } => {
             event_router.set_role("buyer");
-            handle_buy(&node, &events_tx, &event_router, &invoice, &encrypted_file, &hash, &output);
+            handle_buy(&node, emitter.as_ref(), &event_router, &invoice, &encrypted_file, &hash, &output);
         }
     }
 
