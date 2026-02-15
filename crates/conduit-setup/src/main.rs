@@ -389,6 +389,44 @@ fn save_catalog(storage_dir: &str, catalog: &[CatalogEntry]) {
     println!("Catalog saved: {} ({} entries)", path, catalog.len());
 }
 
+/// Startup migration: recompute chunk metadata for legacy seeder catalog entries
+/// that have chunk_count == 0 but have an encrypted file on disk.
+fn migrate_legacy_chunks(storage_dir: &str, catalog: &mut Vec<CatalogEntry>) {
+    let mut migrated = 0usize;
+    for entry in catalog.iter_mut() {
+        // Only migrate seeder entries: content_hash is empty (seeder doesn't know H(F)),
+        // enc_file_path exists, and chunk_count is still 0 (legacy).
+        if entry.chunk_count > 0 || entry.enc_file_path.is_empty() {
+            continue;
+        }
+        // Read the encrypted file from disk
+        let encrypted = match std::fs::read(&entry.enc_file_path) {
+            Ok(data) => data,
+            Err(e) => {
+                eprintln!("migrate_legacy_chunks: skip {} — cannot read {}: {}",
+                          entry.file_name, entry.enc_file_path, e);
+                continue;
+            }
+        };
+        // Compute chunk metadata
+        let cs = chunk::select_chunk_size(encrypted.len());
+        let (enc_chunks, meta) = chunk::split(&encrypted, cs);
+        let enc_tree = MerkleTree::from_chunks(&enc_chunks);
+
+        entry.chunk_size = meta.chunk_size;
+        entry.chunk_count = meta.count;
+        entry.encrypted_root = hex::encode(enc_tree.root());
+        // chunks_held stays empty → means "has all chunks"
+        migrated += 1;
+        println!("migrate_legacy_chunks: {} → {} chunks (size {})",
+                 entry.file_name, meta.count, meta.chunk_size);
+    }
+    if migrated > 0 {
+        save_catalog(storage_dir, catalog);
+        println!("Migrated {} legacy catalog entries with chunk metadata.", migrated);
+    }
+}
+
 async fn sell_handler(
     State(state): State<AppState>,
     Json(req): Json<SellRequest>,
@@ -3595,11 +3633,13 @@ fn main() {
     }
 
     // Load content catalog
-    let catalog = Arc::new(std::sync::Mutex::new(load_catalog(&config.storage_dir)));
-    {
-        let cat = catalog.lock().unwrap();
-        println!("Catalog: {} entries loaded from {}", cat.len(), catalog_path(&config.storage_dir));
-    }
+    let mut cat_vec = load_catalog(&config.storage_dir);
+    println!("Catalog: {} entries loaded from {}", cat_vec.len(), catalog_path(&config.storage_dir));
+
+    // Migrate legacy seeder entries that lack chunk metadata
+    migrate_legacy_chunks(&config.storage_dir, &mut cat_vec);
+
+    let catalog = Arc::new(std::sync::Mutex::new(cat_vec));
 
     // Build registry info if --registry-url is set
     // Resolve public IP for registry announcements
@@ -3628,6 +3668,40 @@ fn main() {
             ln_address: ln_addr,
         }
     });
+
+    // Re-announce seeder entries to registry (picks up migrated chunk metadata)
+    if let Some(ref info) = registry_info {
+        let cat = catalog.lock().unwrap();
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+        for entry in cat.iter() {
+            // Only re-announce seeder entries (those with non-empty encrypted_hash
+            // and empty content_hash — i.e. this node is a seeder, not the creator)
+            if entry.encrypted_hash.is_empty() || !entry.content_hash.is_empty() {
+                continue;
+            }
+            if entry.chunk_count == 0 {
+                continue; // still legacy, nothing useful to announce
+            }
+            let body = serde_json::json!({
+                "encrypted_hash": &entry.encrypted_hash,
+                "seeder_pubkey": &info.node_pubkey,
+                "seeder_address": &info.http_address,
+                "seeder_ln_address": &info.ln_address,
+                "transport_price": entry.transport_price,
+                "chunk_count": entry.chunk_count,
+                "chunks_held": &entry.chunks_held,
+                "announced_at": &entry.registered_at,
+            });
+            let url = format!("{}/api/seeders", info.url);
+            match client.post(&url).json(&body).send() {
+                Ok(resp) => println!("Registry re-announce {}: {} ({})", entry.file_name, entry.encrypted_hash, resp.status()),
+                Err(e) => eprintln!("Warning: re-announce failed for {}: {}", entry.file_name, e),
+            }
+        }
+    }
 
     // Start HTTP server if requested
     if let Some(http_port) = cli.http_port {
