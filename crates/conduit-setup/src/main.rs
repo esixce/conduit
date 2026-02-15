@@ -409,7 +409,7 @@ async fn buy_handler(
     let node = state.node.clone();
     let tx = state.events_tx.clone();
     let router = state.event_router.clone();
-    let is_chunked = req.mode.as_deref() == Some("chunked");
+    let is_chunked = matches!(req.mode.as_deref(), Some("chunked") | Some("seeder"));
     let is_two_phase = req.transport_invoice.is_some() && req.content_invoice.is_some();
     thread::spawn(move || {
         if is_chunked {
