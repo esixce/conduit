@@ -24,8 +24,8 @@ BACKUP_DIR="${BACKUP_ROOT}/${TIMESTAMP}"
 
 CREATOR_IP="${CONDUIT_CREATOR_IP:?Set CONDUIT_CREATOR_IP}"
 BUYER_IP="${CONDUIT_BUYER_IP:?Set CONDUIT_BUYER_IP}"
-CREATOR_STORAGE="/tmp/conduit-creator"
-BUYER_STORAGE="/tmp/conduit-buyer"
+CREATOR_STORAGE="/var/lib/conduit-creator"
+BUYER_STORAGE="/var/lib/conduit-buyer"
 
 echo "=== Conduit Node Backup ==="
 echo "Timestamp: ${TIMESTAMP}"

@@ -7,8 +7,8 @@
 # Falls back to polling if inotify is unavailable.
 #
 # Usage (on the droplet):
-#   nohup ./watch-and-backup.sh /tmp/conduit-creator user@backup-host:/backups/creator &
-#   nohup ./watch-and-backup.sh /tmp/conduit-buyer   user@backup-host:/backups/buyer &
+#   nohup ./watch-and-backup.sh /var/lib/conduit-creator user@backup-host:/backups/creator &
+#   nohup ./watch-and-backup.sh /var/lib/conduit-buyer   user@backup-host:/backups/buyer &
 # ------------------------------------------------------------------
 set -euo pipefail
 
