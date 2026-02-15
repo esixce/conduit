@@ -660,6 +660,11 @@ struct AdInvoiceRequest {
 /// - **Invoice 2 (advertiser_invoice):** preimage = K_ad (random), amount = content price.
 ///   The advertiser pays this after attestation. K_ad is meaningless.
 ///
+/// **HOLD-AND-CLAIM-TOGETHER:** The creator does NOT claim Invoice 1 (which
+/// would reveal K) until Invoice 2's HTLC also arrives. This protects the
+/// creator from giving away K for 1 sat if the advertiser never pays.
+/// Once BOTH HTLCs are pending, the creator claims both atomically.
+///
 /// The advertiser NEVER learns K. TEE-safe.
 async fn ad_invoice_handler(
     State(state): State<AppState>,
@@ -758,21 +763,27 @@ async fn ad_invoice_handler(
         "mode": "ad-subsidized-two-payment",
     }));
 
-    // Spawn threads to wait for BOTH payments and claim them
+    // -----------------------------------------------------------------------
+    // HOLD-AND-CLAIM-TOGETHER
+    //
+    // Spawn ONE thread that waits for BOTH HTLCs to arrive before claiming
+    // either. This prevents the creator from revealing K (by claiming
+    // Invoice 1) before the advertiser's HTLC (Invoice 2) is locked in.
+    //
+    // Without this, the creator would claim Invoice 1 immediately, the buyer
+    // learns K and decrypts, and the advertiser could simply never pay —
+    // leaving the creator with only 1 sat for their content.
+    //
+    // With hold-and-claim, the creator keeps both HTLCs pending until both
+    // are in-flight, then claims both. If either HTLC times out before the
+    // other arrives, the creator lets both expire (no content is delivered).
+    // -----------------------------------------------------------------------
     {
         let node = state.node.clone();
         let tx2 = state.events_tx.clone();
         let router = state.event_router.clone();
         thread::spawn(move || {
-            handle_sell_from_catalog(&node, &tx2, &router, &key);
-        });
-    }
-    {
-        let node = state.node.clone();
-        let tx2 = state.events_tx.clone();
-        let router = state.event_router.clone();
-        thread::spawn(move || {
-            handle_sell_from_catalog(&node, &tx2, &router, &k_ad);
+            handle_ad_sell_hold_and_claim(&node, &tx2, &router, &key, &k_ad);
         });
     }
 
@@ -2264,6 +2275,150 @@ fn handle_sell_from_catalog(
 }
 
 // ---------------------------------------------------------------------------
+// Ad-subsidized sell: HOLD-AND-CLAIM-TOGETHER
+//
+// Waits for BOTH Invoice 1 (K, from buyer) and Invoice 2 (K_ad, from
+// advertiser) HTLCs to arrive before claiming either. This guarantees
+// the creator never reveals K unless the advertiser's payment is locked in.
+//
+// Trust analysis:
+//   - Buyer:      Risks ~15s of time watching the ad. Acceptable.
+//   - Advertiser: Trusts the buyer's app displayed the ad (attestation).
+//   - Creator:    TRUSTLESS — holds K until both HTLCs are pending.
+//   - If Invoice 2 never arrives (advertiser doesn't pay), the creator
+//     lets Invoice 1 expire. The buyer's 1 sat is returned. No content
+//     is delivered. Nobody loses money.
+// ---------------------------------------------------------------------------
+
+fn handle_ad_sell_hold_and_claim(
+    node: &Arc<Node>,
+    tx: &broadcast::Sender<ConsoleEvent>,
+    router: &Arc<EventRouter>,
+    key_k: &[u8; 32],      // Invoice 1 preimage: content key K
+    key_k_ad: &[u8; 32],   // Invoice 2 preimage: random K_ad
+) {
+    let role = "creator";
+
+    // Compute payment hashes
+    let hash_k = PaymentHash(verify::sha256_hash(key_k));
+    let hash_k_ad = PaymentHash(verify::sha256_hash(key_k_ad));
+
+    // Register for events on BOTH payment hashes
+    let rx_k = router.register(hash_k);
+    let rx_k_ad = router.register(hash_k_ad);
+
+    emit(tx, role, "AD_HOLD_WAITING", serde_json::json!({
+        "message": "Waiting for BOTH Invoice 1 (buyer) and Invoice 2 (advertiser) HTLCs before claiming either",
+        "buyer_payment_hash": hex::encode(hash_k.0),
+        "ad_payment_hash": hex::encode(hash_k_ad.0),
+    }));
+
+    // Track which HTLCs have arrived
+    let mut buyer_htlc: Option<u64> = None;   // amount_msat when arrived
+    let mut ad_htlc: Option<u64> = None;       // amount_msat when arrived
+
+    // Poll both receivers. We use try_recv with a short sleep to multiplex
+    // two channels without blocking on either one forever.
+    loop {
+        // Check for Invoice 1 (buyer, K)
+        if buyer_htlc.is_none() {
+            if let Ok(event) = rx_k.try_recv() {
+                if let Event::PaymentClaimable { claimable_amount_msat, .. } = event {
+                    emit(tx, role, "AD_HTLC_BUYER_ARRIVED", serde_json::json!({
+                        "payment_hash": hex::encode(hash_k.0),
+                        "amount_msat": claimable_amount_msat,
+                        "message": "Buyer's HTLC arrived — HOLDING until advertiser's HTLC also arrives",
+                    }));
+                    buyer_htlc = Some(claimable_amount_msat);
+                }
+            }
+        }
+
+        // Check for Invoice 2 (advertiser, K_ad)
+        if ad_htlc.is_none() {
+            if let Ok(event) = rx_k_ad.try_recv() {
+                if let Event::PaymentClaimable { claimable_amount_msat, .. } = event {
+                    emit(tx, role, "AD_HTLC_ADVERTISER_ARRIVED", serde_json::json!({
+                        "payment_hash": hex::encode(hash_k_ad.0),
+                        "amount_msat": claimable_amount_msat,
+                        "message": "Advertiser's HTLC arrived — HOLDING until buyer's HTLC also arrives",
+                    }));
+                    ad_htlc = Some(claimable_amount_msat);
+                }
+            }
+        }
+
+        // If BOTH have arrived, claim both and break
+        if let (Some(buyer_amt), Some(ad_amt)) = (buyer_htlc, ad_htlc) {
+            emit(tx, role, "AD_BOTH_HTLCS_READY", serde_json::json!({
+                "message": "BOTH HTLCs arrived — claiming both now",
+                "buyer_amount_msat": buyer_amt,
+                "ad_amount_msat": ad_amt,
+            }));
+
+            // Claim Invoice 2 first (K_ad, meaningless) — order doesn't
+            // matter since both HTLCs are already locked in, but claiming
+            // the advertiser's payment first is a nice convention.
+            invoice::claim_payment(node, key_k_ad, ad_amt)
+                .expect("Failed to claim advertiser payment");
+            emit(tx, role, "AD_CLAIMED_ADVERTISER", serde_json::json!({
+                "preimage": hex::encode(key_k_ad),
+                "amount_msat": ad_amt,
+                "message": "Advertiser payment claimed (K_ad revealed — meaningless)",
+            }));
+
+            // Claim Invoice 1 (K, the content key) — buyer learns K
+            invoice::claim_payment(node, key_k, buyer_amt)
+                .expect("Failed to claim buyer payment");
+            emit(tx, role, "AD_CLAIMED_BUYER", serde_json::json!({
+                "preimage": hex::encode(key_k),
+                "amount_msat": buyer_amt,
+                "message": "Buyer payment claimed (K revealed — buyer can now decrypt content)",
+            }));
+
+            break;
+        }
+
+        // Brief sleep to avoid busy-waiting
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    // Wait for PaymentReceived confirmations for both
+    let mut k_confirmed = false;
+    let mut k_ad_confirmed = false;
+    while !k_confirmed || !k_ad_confirmed {
+        if !k_confirmed {
+            if let Ok(Event::PaymentReceived { amount_msat, .. }) = rx_k.try_recv() {
+                emit(tx, role, "AD_PAYMENT_CONFIRMED_BUYER", serde_json::json!({
+                    "amount_msat": amount_msat,
+                    "message": "Buyer payment fully settled",
+                }));
+                k_confirmed = true;
+            }
+        }
+        if !k_ad_confirmed {
+            if let Ok(Event::PaymentReceived { amount_msat, .. }) = rx_k_ad.try_recv() {
+                emit(tx, role, "AD_PAYMENT_CONFIRMED_ADVERTISER", serde_json::json!({
+                    "amount_msat": amount_msat,
+                    "message": "Advertiser payment fully settled",
+                }));
+                k_ad_confirmed = true;
+            }
+        }
+        if !k_confirmed || !k_ad_confirmed {
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    emit(tx, role, "AD_SALE_COMPLETE", serde_json::json!({
+        "message": "Ad-subsidized sale complete — both payments settled trustlessly",
+    }));
+
+    router.unregister(&hash_k);
+    router.unregister(&hash_k_ad);
+}
+
+// ---------------------------------------------------------------------------
 // buy command (single-phase: direct from creator)
 // ---------------------------------------------------------------------------
 
@@ -2556,6 +2711,59 @@ fn handle_buy_two_phase(
 }
 
 // ---------------------------------------------------------------------------
+// A5: Chunk planner — rarest-first selection (BitTorrent / eMule style)
+// ---------------------------------------------------------------------------
+
+/// Rarest-first chunk assignment.
+///
+/// Computes chunk rarity (how many seeders hold each chunk), then assigns
+/// chunks to seeders starting with the rarest.  Within the same rarity tier
+/// the chunk with the lowest index wins (deterministic).  Each chunk is given
+/// to the seeder that currently has the fewest assignments (load-balanced).
+///
+/// Returns `(download_order, assignments)` where:
+///   - `download_order`: chunk indices sorted by rarity ascending
+///   - `assignments[chunk_idx]`: `Some(seeder_index)` or `None` if no seeder
+///     has that chunk
+fn plan_chunk_assignments(
+    chunk_count: usize,
+    seeder_bitfields: &[Vec<bool>],
+) -> (Vec<usize>, Vec<Option<usize>>) {
+    let num_seeders = seeder_bitfields.len();
+
+    // 1. Compute rarity per chunk (how many seeders hold it)
+    let rarity: Vec<usize> = (0..chunk_count)
+        .map(|ci| {
+            (0..num_seeders)
+                .filter(|&si| seeder_bitfields[si].get(ci).copied().unwrap_or(false))
+                .count()
+        })
+        .collect();
+
+    // 2. Sort chunk indices by rarity ascending (rarest first),
+    //    tie-break by chunk index ascending (deterministic)
+    let mut order: Vec<usize> = (0..chunk_count).collect();
+    order.sort_by_key(|&ci| (rarity[ci], ci));
+
+    // 3. Assign in rarity order: pick the seeder with the fewest assignments
+    let mut assignments: Vec<Option<usize>> = vec![None; chunk_count];
+    let mut seeder_load: Vec<usize> = vec![0; num_seeders];
+
+    for &ci in &order {
+        let available: Vec<usize> = (0..num_seeders)
+            .filter(|&si| seeder_bitfields[si].get(ci).copied().unwrap_or(false))
+            .collect();
+        if let Some(&best) = available.iter().min_by_key(|&&si| seeder_load[si]) {
+            assignments[ci] = Some(best);
+            seeder_load[best] += 1;
+        }
+        // else: None — caller must handle missing chunks
+    }
+
+    (order, assignments)
+}
+
+// ---------------------------------------------------------------------------
 // A5: Chunked buy — fetch chunks from multiple seeders, verify, reassemble
 // ---------------------------------------------------------------------------
 
@@ -2769,42 +2977,68 @@ fn handle_buy_chunked(
         }
     }
 
-    // Assign each chunk to a seeder (round-robin among seeders that have it)
-    let mut assignments: Vec<Option<usize>> = vec![None; chunk_count];
-    for chunk_idx in 0..chunk_count {
-        // Find seeders that have this chunk
-        let available: Vec<usize> = (0..req.seeder_urls.len())
-            .filter(|&si| seeder_bitfields[si].get(chunk_idx).copied().unwrap_or(false))
-            .collect();
-        if available.is_empty() {
+    // Rarest-first chunk assignment (BitTorrent / eMule style)
+    let (download_order, assignments) = plan_chunk_assignments(chunk_count, &seeder_bitfields);
+
+    // Check for unassignable chunks (no seeder has them)
+    for &ci in &download_order {
+        if assignments[ci].is_none() {
             emit(tx, role, "BUY_ERROR", serde_json::json!({
-                "message": format!("No seeder has chunk {}!", chunk_idx),
-                "chunk_index": chunk_idx,
+                "message": format!("No seeder has chunk {}!", ci),
+                "chunk_index": ci,
             }));
             return;
         }
-        // Round-robin: assign to seeder with fewest assignments so far
-        let best = available.iter()
-            .min_by_key(|&&si| assignments.iter().filter(|a| **a == Some(si)).count())
-            .unwrap();
-        assignments[chunk_idx] = Some(*best);
+    }
+
+    // Build rarity histogram for diagnostics
+    let rarity: Vec<usize> = (0..chunk_count)
+        .map(|ci| {
+            seeder_bitfields.iter()
+                .filter(|bf| bf.get(ci).copied().unwrap_or(false))
+                .count()
+        })
+        .collect();
+    let mut rarity_histogram: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
+    for &r in &rarity {
+        *rarity_histogram.entry(r).or_insert(0) += 1;
     }
 
     emit(tx, role, "CHUNK_PLAN", serde_json::json!({
         "assignments": assignments.iter().map(|a| a.unwrap_or(0)).collect::<Vec<_>>(),
-        "message": format!("Chunk download plan ready: {} chunks across {} seeders", chunk_count, req.seeder_urls.len()),
+        "download_order": download_order,
+        "rarity_histogram": rarity_histogram,
+        "message": format!(
+            "Rarest-first plan: {} chunks across {} seeders (rarity dist: {})",
+            chunk_count,
+            req.seeder_urls.len(),
+            rarity_histogram.iter()
+                .map(|(r, n)| format!("{}x held-by-{}", n, r))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
     }));
 
     // -----------------------------------------------------------------------
     // PHASE 4: Request transport invoices from each seeder (batched per seeder)
     // -----------------------------------------------------------------------
 
-    // Group chunks by seeder
+    // Group chunks by seeder, ordered by rarity (rarest first within each batch).
+    // Build a position map from download_order so we can sort each seeder's
+    // chunks in the same rarest-first order.
+    let mut rarity_pos: Vec<usize> = vec![0; chunk_count];
+    for (pos, &ci) in download_order.iter().enumerate() {
+        rarity_pos[ci] = pos;
+    }
     let mut seeder_chunks: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
     for (ci, assignment) in assignments.iter().enumerate() {
         if let Some(si) = assignment {
             seeder_chunks.entry(*si).or_default().push(ci);
         }
+    }
+    // Sort each seeder's chunk list by rarity position (rarest first)
+    for chunks in seeder_chunks.values_mut() {
+        chunks.sort_by_key(|&ci| rarity_pos[ci]);
     }
 
     // For each seeder, request a transport invoice for its chunks
@@ -3189,7 +3423,7 @@ fn handle_buy(
 #[command(about = "Conduit Lightning node with live console")]
 struct Cli {
     /// Storage directory for LDK node data
-    #[arg(long, default_value = "/tmp/conduit-node")]
+    #[arg(long, default_value = "/var/lib/conduit-node")]
     storage_dir: String,
 
     /// Lightning listening port
@@ -3874,3 +4108,134 @@ function esc(s) { const d = document.createElement('div'); d.textContent = s; re
 </script>
 </body>
 </html>"##;
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::plan_chunk_assignments;
+
+    /// All seeders have all chunks → load should be balanced evenly.
+    #[test]
+    fn uniform_availability() {
+        // 2 seeders, 6 chunks, both have everything
+        let bf = vec![
+            vec![true, true, true, true, true, true],
+            vec![true, true, true, true, true, true],
+        ];
+        let (order, assignments) = plan_chunk_assignments(6, &bf);
+
+        // Every chunk must be assigned
+        assert!(assignments.iter().all(|a| a.is_some()));
+
+        // Load should be balanced: 3 each
+        let s0 = assignments.iter().filter(|a| **a == Some(0)).count();
+        let s1 = assignments.iter().filter(|a| **a == Some(1)).count();
+        assert_eq!(s0, 3);
+        assert_eq!(s1, 3);
+
+        // Order should contain all chunk indices
+        assert_eq!(order.len(), 6);
+        let mut sorted_order = order.clone();
+        sorted_order.sort();
+        assert_eq!(sorted_order, vec![0, 1, 2, 3, 4, 5]);
+    }
+
+    /// One chunk held by only 1 seeder → it should be assigned first to that
+    /// seeder and appear first in download order.
+    #[test]
+    fn skewed_availability_rarest_first() {
+        // 2 seeders, 4 chunks
+        // Chunk 2 is only on seeder 0 (rarity 1)
+        // Chunks 0,1,3 are on both seeders (rarity 2)
+        let bf = vec![
+            vec![true, true, true, true],
+            vec![true, true, false, true],
+        ];
+        let (order, assignments) = plan_chunk_assignments(4, &bf);
+
+        // Chunk 2 must be first in download order (rarity 1)
+        assert_eq!(order[0], 2);
+
+        // Chunk 2 must be assigned to seeder 0 (only one that has it)
+        assert_eq!(assignments[2], Some(0));
+
+        // All chunks assigned
+        assert!(assignments.iter().all(|a| a.is_some()));
+    }
+
+    /// A chunk held by no seeder → should get None.
+    #[test]
+    fn no_availability() {
+        // 2 seeders, 3 chunks. Chunk 1 not held by anyone.
+        let bf = vec![
+            vec![true, false, true],
+            vec![true, false, true],
+        ];
+        let (order, assignments) = plan_chunk_assignments(3, &bf);
+
+        // Chunk 1 has no seeder → None
+        assert_eq!(assignments[1], None);
+
+        // Chunk 1 should be first in order (rarity 0 < rarity 2)
+        assert_eq!(order[0], 1);
+
+        // Other chunks assigned
+        assert!(assignments[0].is_some());
+        assert!(assignments[2].is_some());
+    }
+
+    /// Single seeder has everything → all chunks go to seeder 0.
+    #[test]
+    fn single_seeder() {
+        let bf = vec![
+            vec![true, true, true, true, true],
+        ];
+        let (_order, assignments) = plan_chunk_assignments(5, &bf);
+
+        assert!(assignments.iter().all(|a| *a == Some(0)));
+    }
+
+    /// 3 seeders with partial overlap.
+    /// Verify rarest chunks are prioritised and load is balanced.
+    #[test]
+    fn three_seeders_partial_overlap() {
+        // 3 seeders, 6 chunks:
+        //   chunk 0: seeder 0 only              → rarity 1
+        //   chunk 1: seeders 0, 1               → rarity 2
+        //   chunk 2: seeders 0, 1, 2            → rarity 3
+        //   chunk 3: seeders 1, 2               → rarity 2
+        //   chunk 4: seeder 2 only              → rarity 1
+        //   chunk 5: seeders 0, 1, 2            → rarity 3
+        let bf = vec![
+            vec![true,  true,  true,  false, false, true],
+            vec![false, true,  true,  true,  false, true],
+            vec![false, false, true,  true,  true,  true],
+        ];
+        let (order, assignments) = plan_chunk_assignments(6, &bf);
+
+        // Rarest chunks (rarity 1) should appear first in order
+        // chunk 0 (rarity 1) and chunk 4 (rarity 1) must be in first 2 positions
+        let first_two: Vec<usize> = order[..2].to_vec();
+        assert!(first_two.contains(&0), "chunk 0 (rarity 1) should be in first two");
+        assert!(first_two.contains(&4), "chunk 4 (rarity 1) should be in first two");
+
+        // chunk 0 can only go to seeder 0, chunk 4 can only go to seeder 2
+        assert_eq!(assignments[0], Some(0));
+        assert_eq!(assignments[4], Some(2));
+
+        // All chunks assigned (every chunk has at least one seeder)
+        assert!(assignments.iter().all(|a| a.is_some()));
+
+        // Rarity-2 chunks (1, 3) should come next, then rarity-3 chunks (2, 5)
+        let mid_two: Vec<usize> = order[2..4].to_vec();
+        assert!(mid_two.contains(&1), "chunk 1 (rarity 2) should be in positions 2-3");
+        assert!(mid_two.contains(&3), "chunk 3 (rarity 2) should be in positions 2-3");
+
+        let last_two: Vec<usize> = order[4..6].to_vec();
+        assert!(last_two.contains(&2), "chunk 2 (rarity 3) should be in positions 4-5");
+        assert!(last_two.contains(&5), "chunk 5 (rarity 3) should be in positions 4-5");
+    }
+}
