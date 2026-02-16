@@ -45,9 +45,7 @@ use conduit_core::verify;
 /// Returns `true` if the test should run, `false` to skip.
 fn integration_enabled() -> bool {
     if std::env::var("CONDUIT_INTEGRATION").is_err() {
-        eprintln!(
-            "SKIP: Set CONDUIT_INTEGRATION=1 to run integration tests."
-        );
+        eprintln!("SKIP: Set CONDUIT_INTEGRATION=1 to run integration tests.");
         return false;
     }
     true
@@ -65,10 +63,8 @@ fn test_chain_source() -> ChainSource {
             .unwrap_or_else(|_| "38332".into())
             .parse()
             .expect("CONDUIT_RPC_PORT must be a valid u16");
-        let user = std::env::var("CONDUIT_RPC_USER")
-            .unwrap_or_else(|_| "lightning".into());
-        let password = std::env::var("CONDUIT_RPC_PASSWORD")
-            .unwrap_or_else(|_| "lightning".into());
+        let user = std::env::var("CONDUIT_RPC_USER").unwrap_or_else(|_| "lightning".into());
+        let password = std::env::var("CONDUIT_RPC_PASSWORD").unwrap_or_else(|_| "lightning".into());
         ChainSource::BitcoindRpc {
             host,
             port,
@@ -84,8 +80,11 @@ fn test_chain_source() -> ChainSource {
 
 /// Create a unique temp directory for node storage.
 fn temp_node_dir(name: &str) -> String {
-    let dir = std::env::temp_dir()
-        .join(format!("conduit-integration-{}-{}", name, std::process::id()));
+    let dir = std::env::temp_dir().join(format!(
+        "conduit-integration-{}-{}",
+        name,
+        std::process::id()
+    ));
     std::fs::create_dir_all(&dir).expect("create temp dir");
     dir.to_string_lossy().to_string()
 }
@@ -185,9 +184,7 @@ fn test_create_invoice_payment_hash() {
 
     // Parse the invoice and verify payment hash matches SHA-256(key)
     use ldk_node::lightning_invoice::Bolt11Invoice;
-    let invoice_parsed: Bolt11Invoice = bolt11_str
-        .parse()
-        .expect("should parse as valid BOLT11");
+    let invoice_parsed: Bolt11Invoice = bolt11_str.parse().expect("should parse as valid BOLT11");
 
     let invoice_hash_bytes: &[u8] = invoice_parsed.payment_hash().as_ref();
     let mut invoice_hash = [0u8; 32];
@@ -271,13 +268,11 @@ fn test_full_payment_cycle() {
     };
 
     eprintln!("Starting creator node...");
-    let creator_node =
-        invoice::start_node(&creator_config).expect("creator node should start");
+    let creator_node = invoice::start_node(&creator_config).expect("creator node should start");
     eprintln!("Creator node: {}", invoice::node_id(&creator_node));
 
     eprintln!("Starting buyer node...");
-    let buyer_node =
-        invoice::start_node(&buyer_config).expect("buyer node should start");
+    let buyer_node = invoice::start_node(&buyer_config).expect("buyer node should start");
     eprintln!("Buyer node: {}", invoice::node_id(&buyer_node));
 
     // Let nodes sync and discover each other's channels
@@ -308,10 +303,7 @@ fn test_full_payment_cycle() {
         eprintln!("[creator] Waiting for payment...");
         let received = invoice::wait_and_claim_payment(&creator_node, &creator_key)
             .expect("creator should receive payment");
-        eprintln!(
-            "[creator] Payment received: {} msat",
-            received.amount_msat
-        );
+        eprintln!("[creator] Payment received: {} msat", received.amount_msat);
 
         // The preimage the creator revealed should be our original key
         assert_eq!(
@@ -367,9 +359,7 @@ fn test_full_payment_cycle() {
     let _creator_result = creator_handle
         .join()
         .expect("creator thread should not panic");
-    let _buyer_result = buyer_handle
-        .join()
-        .expect("buyer thread should not panic");
+    let _buyer_result = buyer_handle.join().expect("buyer thread should not panic");
 
     eprintln!("Full payment cycle completed successfully.");
     eprintln!("The atomic exchange works: payment revealed the decryption key.");
@@ -459,13 +449,11 @@ fn test_atomic_content_exchange() {
     // ── Start both nodes ──────────────────────────────────────────────────
 
     eprintln!("Starting creator node...");
-    let creator_node =
-        invoice::start_node(&creator_config).expect("creator node should start");
+    let creator_node = invoice::start_node(&creator_config).expect("creator node should start");
     eprintln!("Creator: {}", invoice::node_id(&creator_node));
 
     eprintln!("Starting buyer node...");
-    let buyer_node =
-        invoice::start_node(&buyer_config).expect("buyer node should start");
+    let buyer_node = invoice::start_node(&buyer_config).expect("buyer node should start");
     eprintln!("Buyer: {}", invoice::node_id(&buyer_node));
 
     eprintln!("Waiting for nodes to sync...");
@@ -508,7 +496,10 @@ fn test_atomic_content_exchange() {
 
         let result = invoice::wait_for_outbound_payment(&buyer_node, &payment_hash)
             .expect("buyer should receive payment confirmation");
-        eprintln!("[buyer] Preimage received: {}", hex::encode(result.preimage));
+        eprintln!(
+            "[buyer] Preimage received: {}",
+            hex::encode(result.preimage)
+        );
         buyer_node.stop().expect("buyer should stop");
         result
     });
