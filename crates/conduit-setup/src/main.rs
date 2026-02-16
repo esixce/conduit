@@ -44,7 +44,7 @@ use tower_http::cors::CorsLayer;
 // Advertiser role
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use rusqlite::Connection;
-use sha2::{Digest, Sha256};
+
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -307,6 +307,7 @@ struct AppState {
     advertiser_db: Option<Arc<std::sync::Mutex<Connection>>>,
     advertiser_signing_key: Option<Arc<SigningKey>>,
     advertiser_pubkey_hex: Option<String>,
+    #[allow(dead_code)]
     ads_dir: Option<String>,
     // Dashboard
     dashboard_path: Option<String>,
@@ -1586,7 +1587,7 @@ async fn wrapped_chunk_handler(
 struct AdvCampaign {
     campaign_id: String,
     name: String,
-    creative_file: String,
+    creative_url: String,
     creative_hash: String,
     creative_format: String,
     duration_ms: u64,
@@ -1628,8 +1629,8 @@ fn adv_init_db(conn: &Connection) {
         "CREATE TABLE IF NOT EXISTS campaigns (
             campaign_id TEXT PRIMARY KEY,
             name TEXT NOT NULL,
-            creative_file TEXT NOT NULL,
-            creative_hash TEXT NOT NULL,
+            creative_url TEXT NOT NULL,
+            creative_hash TEXT NOT NULL DEFAULT '',
             creative_format TEXT NOT NULL,
             duration_ms INTEGER NOT NULL,
             subsidy_sats INTEGER NOT NULL,
@@ -1669,7 +1670,7 @@ fn adv_now_unix() -> u64 {
 fn adv_load_campaigns(db: &Connection) -> Vec<AdvCampaign> {
     let mut stmt = db
         .prepare(
-            "SELECT campaign_id, name, creative_file, creative_hash, creative_format,
+            "SELECT campaign_id, name, creative_url, creative_hash, creative_format,
                     duration_ms, subsidy_sats, budget_total_sats, budget_spent_sats,
                     active, created_at
              FROM campaigns ORDER BY created_at DESC",
@@ -1680,7 +1681,7 @@ fn adv_load_campaigns(db: &Connection) -> Vec<AdvCampaign> {
         Ok(AdvCampaign {
             campaign_id: row.get(0)?,
             name: row.get(1)?,
-            creative_file: row.get(2)?,
+            creative_url: row.get(2)?,
             creative_hash: row.get(3)?,
             creative_format: row.get(4)?,
             duration_ms: row.get(5)?,
@@ -1696,67 +1697,14 @@ fn adv_load_campaigns(db: &Connection) -> Vec<AdvCampaign> {
     .collect()
 }
 
-fn adv_sha256_file(path: &str) -> Result<String, std::io::Error> {
-    let data = std::fs::read(path)?;
-    let mut hasher = Sha256::new();
-    hasher.update(&data);
-    Ok(hex::encode(hasher.finalize()))
-}
-
-fn adv_seed_default_campaign(db: &Connection, ads_dir: &str) {
-    let count: i64 = db
-        .query_row("SELECT COUNT(*) FROM campaigns", [], |row| row.get(0))
-        .unwrap_or(0);
-    if count > 0 {
-        return;
-    }
-    let entries: Vec<_> = match std::fs::read_dir(ads_dir) {
-        Ok(rd) => rd
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().is_file())
-            .collect(),
-        Err(_) => {
-            println!("No ads directory found at '{}', skipping default campaign seed.", ads_dir);
-            return;
-        }
-    };
-    if entries.is_empty() {
-        println!("No ad creative files found in '{}'. Place a video/image file there.", ads_dir);
-        return;
-    }
-    let entry = &entries[0];
-    let file_name = entry.file_name().to_string_lossy().to_string();
-    let file_path = entry.path().to_string_lossy().to_string();
-    let creative_hash = match adv_sha256_file(&file_path) {
-        Ok(h) => h,
-        Err(e) => { eprintln!("Failed to hash {}: {}", file_path, e); return; }
-    };
-    let ext = std::path::Path::new(&file_name)
-        .extension()
-        .map(|e| e.to_string_lossy().to_lowercase())
-        .unwrap_or_default();
-    let creative_format = match ext.as_str() {
-        "mp4" => "video/mp4",
-        "webm" => "video/webm",
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        _ => "application/octet-stream",
-    };
-    let campaign_id = Uuid::new_v4().to_string();
-    db.execute(
-        "INSERT INTO campaigns
-         (campaign_id, name, creative_file, creative_hash, creative_format,
-          duration_ms, subsidy_sats, budget_total_sats, budget_spent_sats,
-          active, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, 1, ?9)",
-        rusqlite::params![
-            campaign_id, format!("Bitcoin Ad - {}", file_name), file_name,
-            creative_hash, creative_format, 15000, 50, 1_000_000, adv_now_unix(),
-        ],
-    )
-    .unwrap();
-    println!("Seeded default campaign: {} ({})", file_name, campaign_id);
+fn adv_infer_format(url: &str) -> &'static str {
+    let lower = url.to_lowercase();
+    if lower.ends_with(".mp4") { "video/mp4" }
+    else if lower.ends_with(".webm") { "video/webm" }
+    else if lower.ends_with(".png") { "image/png" }
+    else if lower.ends_with(".jpg") || lower.ends_with(".jpeg") { "image/jpeg" }
+    else if lower.ends_with(".gif") { "image/gif" }
+    else { "application/octet-stream" }
 }
 
 // Attestation crypto helpers
@@ -1815,7 +1763,7 @@ fn adv_load_or_create_signing_key(storage_dir: &str) -> SigningKey {
 async fn adv_list_campaigns(State(state): State<AppState>) -> impl IntoResponse {
     let db = match &state.advertiser_db {
         Some(db) => db,
-        None => return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error": "Advertiser role not enabled (no --ads-dir)"}))).into_response(),
+        None => return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error": "Advertiser role not enabled"}))).into_response(),
     };
     let db = db.lock().unwrap();
     let campaigns = adv_load_campaigns(&db);
@@ -1835,7 +1783,7 @@ async fn adv_get_campaign(
     };
     let db = db.lock().unwrap();
     let result = db.query_row(
-        "SELECT campaign_id, name, creative_file, creative_hash, creative_format,
+        "SELECT campaign_id, name, creative_url, creative_hash, creative_format,
                 duration_ms, subsidy_sats, budget_total_sats, budget_spent_sats,
                 active, created_at
          FROM campaigns WHERE campaign_id = ?1",
@@ -1844,7 +1792,7 @@ async fn adv_get_campaign(
             Ok(AdvCampaign {
                 campaign_id: row.get(0)?,
                 name: row.get(1)?,
-                creative_file: row.get(2)?,
+                creative_url: row.get(2)?,
                 creative_hash: row.get(3)?,
                 creative_format: row.get(4)?,
                 duration_ms: row.get(5)?,
@@ -1862,40 +1810,31 @@ async fn adv_get_campaign(
     }
 }
 
-/// GET /api/campaigns/{campaign_id}/creative -- serve ad creative file
+/// GET /api/campaigns/{campaign_id}/creative -- redirect to advertiser-hosted creative
 async fn adv_serve_creative(
     State(state): State<AppState>,
     AxumPath(campaign_id): AxumPath<String>,
 ) -> impl IntoResponse {
-    let ads_dir = match &state.ads_dir {
-        Some(d) => d.clone(),
+    let db = match &state.advertiser_db {
+        Some(db) => db,
         None => return (StatusCode::SERVICE_UNAVAILABLE, "Advertiser role not enabled").into_response(),
     };
-    let db = state.advertiser_db.as_ref().unwrap().lock().unwrap();
-    let creative: Result<(String, String), _> = db.query_row(
-        "SELECT creative_file, creative_format FROM campaigns WHERE campaign_id = ?1 AND active = 1",
+    let db = db.lock().unwrap();
+    let url: Result<String, _> = db.query_row(
+        "SELECT creative_url FROM campaigns WHERE campaign_id = ?1 AND active = 1",
         rusqlite::params![campaign_id],
-        |row| Ok((row.get(0)?, row.get(1)?)),
+        |row| row.get(0),
     );
-    let (file_name, content_type) = match creative {
-        Ok(f) => f,
-        Err(_) => return (StatusCode::NOT_FOUND, "Campaign not found or inactive").into_response(),
-    };
-    drop(db);
-    let file_path = format!("{}/{}", ads_dir, file_name);
-    match std::fs::read(&file_path) {
-        Ok(data) => {
-            let headers = [
-                (axum::http::header::CONTENT_TYPE, content_type),
-                (axum::http::header::CONTENT_DISPOSITION, format!("inline; filename=\"{}\"", file_name)),
-            ];
-            (headers, data).into_response()
-        }
-        Err(_) => (StatusCode::NOT_FOUND, "Creative file not found on disk").into_response(),
+    match url {
+        Ok(u) => axum::response::Redirect::temporary(&u).into_response(),
+        Err(_) => (StatusCode::NOT_FOUND, "Campaign not found or inactive").into_response(),
     }
 }
 
 /// POST /api/campaigns -- create a new campaign via API
+///
+/// The advertiser hosts creative media on their own server and provides
+/// a `creative_url` pointing to it. Conduit nodes never store ad creatives.
 async fn adv_create_campaign(
     State(state): State<AppState>,
     Json(req): Json<serde_json::Value>,
@@ -1905,55 +1844,44 @@ async fn adv_create_campaign(
         None => return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error": "Advertiser role not enabled"}))).into_response(),
     };
     let name = req["name"].as_str().unwrap_or("Unnamed Campaign").to_string();
-    let creative_file = req["creative_file"].as_str().unwrap_or("").to_string();
+    let creative_url = req["creative_url"].as_str().unwrap_or("").to_string();
     let duration_ms = req["duration_ms"].as_u64().unwrap_or(15000);
     let subsidy_sats = req["subsidy_sats"].as_u64().unwrap_or(50);
     let budget_total = req["budget_total_sats"].as_u64().unwrap_or(1_000_000);
 
-    if creative_file.is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "creative_file is required"}))).into_response();
+    if creative_url.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "creative_url is required"}))).into_response();
     }
 
-    // Compute creative hash and format
-    let ads_dir = state.ads_dir.as_deref().unwrap_or("/tmp");
-    let file_path = format!("{}/{}", ads_dir, creative_file);
-    let creative_hash = match adv_sha256_file(&file_path) {
-        Ok(h) => h,
-        Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("Cannot read creative file: {}", e)}))).into_response(),
-    };
-    let ext = std::path::Path::new(&creative_file)
-        .extension()
-        .map(|e| e.to_string_lossy().to_lowercase())
-        .unwrap_or_default();
-    let creative_format = match ext.as_str() {
-        "mp4" => "video/mp4",
-        "webm" => "video/webm",
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        _ => "application/octet-stream",
-    };
+    // Infer format from URL extension; caller can override with content_type
+    let creative_format = req["content_type"]
+        .as_str()
+        .unwrap_or_else(|| adv_infer_format(&creative_url))
+        .to_string();
+
+    // Hash is optional — advertiser can supply it, otherwise left empty
+    let creative_hash = req["creative_hash"].as_str().unwrap_or("").to_string();
 
     let campaign_id = Uuid::new_v4().to_string();
     let db = db.lock().unwrap();
     db.execute(
         "INSERT INTO campaigns
-         (campaign_id, name, creative_file, creative_hash, creative_format,
+         (campaign_id, name, creative_url, creative_hash, creative_format,
           duration_ms, subsidy_sats, budget_total_sats, budget_spent_sats,
           active, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, 1, ?9)",
         rusqlite::params![
-            campaign_id, name, creative_file,
+            campaign_id, name, creative_url,
             creative_hash, creative_format, duration_ms, subsidy_sats, budget_total,
             adv_now_unix(),
         ],
     )
     .unwrap();
-    println!("[advertiser] Campaign created via API: {} ({})", name, campaign_id);
+    println!("[advertiser] Campaign created: {} → {} ({})", name, creative_url, campaign_id);
     (StatusCode::OK, Json(serde_json::json!({
         "campaign_id": campaign_id,
         "name": name,
-        "creative_file": creative_file,
+        "creative_url": creative_url,
         "creative_format": creative_format,
     }))).into_response()
 }
@@ -3889,7 +3817,9 @@ struct Cli {
     #[arg(long)]
     public_ip: Option<String>,
 
-    /// Path to directory containing ad creative files (advertiser role)
+    /// Enable advertiser role. Value is an arbitrary label (e.g. "enabled").
+    /// Advertisers host creative media on their own servers and register
+    /// campaigns via the API with a creative_url.
     #[arg(long)]
     ads_dir: Option<String>,
 
@@ -4108,14 +4038,10 @@ fn main() {
 
     // Start HTTP server if requested
     if let Some(http_port) = cli.http_port {
-        // Initialize advertiser role if --ads-dir is set
-        let (adv_db, adv_signing_key, adv_pubkey_hex, adv_ads_dir) = if let Some(ref ads_dir) = cli.ads_dir {
-            let ads_path = if std::path::Path::new(ads_dir).is_absolute() {
-                ads_dir.clone()
-            } else {
-                format!("{}/{}", config.storage_dir, ads_dir)
-            };
-            let _ = std::fs::create_dir_all(&ads_path);
+        // Initialize advertiser role if --ads-dir is set.
+        // Advertisers host their own creative media externally; --ads-dir
+        // only enables the advertiser API (campaigns, sessions, payments).
+        let (adv_db, adv_signing_key, adv_pubkey_hex, adv_ads_dir) = if cli.ads_dir.is_some() {
             let db_path = format!("{}/advertiser.db", config.storage_dir);
             let conn = Connection::open(&db_path).expect("Failed to open advertiser database");
             adv_init_db(&conn);
@@ -4124,12 +4050,11 @@ fn main() {
             let verifying_key = VerifyingKey::from(&signing_key);
             let pubkey_hex = hex::encode(verifying_key.to_bytes());
             println!("[advertiser] Ed25519 pubkey: {}", pubkey_hex);
-            adv_seed_default_campaign(&conn, &ads_path);
             (
                 Some(Arc::new(std::sync::Mutex::new(conn))),
                 Some(Arc::new(signing_key)),
                 Some(pubkey_hex),
-                Some(ads_path),
+                cli.ads_dir.clone(),
             )
         } else {
             (None, None, None, None)
