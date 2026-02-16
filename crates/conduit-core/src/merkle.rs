@@ -229,11 +229,7 @@ mod tests {
     #[test]
     fn test_three_chunks_padding() {
         // 3 chunks => leaf layer padded to [L0, L1, L2, L2]
-        let chunks = vec![
-            b"chunk0".to_vec(),
-            b"chunk1".to_vec(),
-            b"chunk2".to_vec(),
-        ];
+        let chunks = vec![b"chunk0".to_vec(), b"chunk1".to_vec(), b"chunk2".to_vec()];
         let tree = MerkleTree::from_chunks(&chunks);
         assert_eq!(tree.leaf_count, 3);
 
@@ -297,11 +293,11 @@ mod tests {
         // Leaf hash and internal hash of the same data must differ
         let data = [0u8; 32];
         let lh = leaf_hash(&data);
-        let ih = internal_hash(
-            &data.try_into().unwrap(),
-            &[0u8; 32],
+        let ih = internal_hash(&data.try_into().unwrap(), &[0u8; 32]);
+        assert_ne!(
+            lh, ih,
+            "Leaf and internal hashes must differ (domain separation)"
         );
-        assert_ne!(lh, ih, "Leaf and internal hashes must differ (domain separation)");
     }
 
     #[test]

@@ -124,10 +124,8 @@ mod tests {
     #[test]
     fn test_nist_sp800_38a_f55_ctr_aes256_encrypt() {
         // Key (256 bits)
-        let key = hex::decode(
-            "603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4",
-        )
-        .unwrap();
+        let key = hex::decode("603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4")
+            .unwrap();
 
         // Initial Counter Block (128 bits)
         let iv = hex::decode("f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff").unwrap();
@@ -157,7 +155,10 @@ mod tests {
         let mut cipher = Ctr128BE::<Aes256>::new(key_arr.into(), iv_arr.into());
         cipher.apply_keystream(&mut buffer);
 
-        assert_eq!(buffer, expected_ciphertext, "NIST F.5.5 CTR-AES256 mismatch");
+        assert_eq!(
+            buffer, expected_ciphertext,
+            "NIST F.5.5 CTR-AES256 mismatch"
+        );
     }
 
     // ---------------------------------------------------------------
@@ -170,10 +171,8 @@ mod tests {
 
     #[test]
     fn test_nist_sp800_38a_f56_ctr_aes256_decrypt() {
-        let key = hex::decode(
-            "603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4",
-        )
-        .unwrap();
+        let key = hex::decode("603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4")
+            .unwrap();
         let iv = hex::decode("f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff").unwrap();
 
         let ciphertext = hex::decode(
@@ -226,7 +225,10 @@ mod tests {
         // Verify encryption is deterministic
         let enc1 = encrypt(plaintext, &key, chunk_index);
         let enc2 = encrypt(plaintext, &key, chunk_index);
-        assert_eq!(enc1, enc2, "Encryption must be deterministic for same key+chunk");
+        assert_eq!(
+            enc1, enc2,
+            "Encryption must be deterministic for same key+chunk"
+        );
 
         // Pin the IV so any derivation change breaks the test
         let expected_iv = hex::encode(iv1);
@@ -258,9 +260,15 @@ mod tests {
     fn test_empty_plaintext_round_trip() {
         let key = generate_key();
         let encrypted = encrypt(b"", &key, 0);
-        assert!(encrypted.is_empty(), "Encrypting empty input produces empty output");
+        assert!(
+            encrypted.is_empty(),
+            "Encrypting empty input produces empty output"
+        );
         let decrypted = decrypt(&encrypted, &key, 0);
-        assert!(decrypted.is_empty(), "Decrypting empty input produces empty output");
+        assert!(
+            decrypted.is_empty(),
+            "Decrypting empty input produces empty output"
+        );
     }
 
     #[test]
@@ -279,7 +287,10 @@ mod tests {
         let iv_zero = derive_iv(&key, 0);
         let iv_max = derive_iv(&key, u64::MAX);
         assert_eq!(iv_max.len(), 16, "IV must be 16 bytes");
-        assert_ne!(iv_zero, iv_max, "chunk_index 0 and u64::MAX must produce different IVs");
+        assert_ne!(
+            iv_zero, iv_max,
+            "chunk_index 0 and u64::MAX must produce different IVs"
+        );
     }
 
     #[test]
@@ -288,6 +299,9 @@ mod tests {
         let plaintext = b"determinism check";
         let enc1 = encrypt(plaintext, &key, 7);
         let enc2 = encrypt(plaintext, &key, 7);
-        assert_eq!(enc1, enc2, "Same key + chunk index must always produce identical ciphertext");
+        assert_eq!(
+            enc1, enc2,
+            "Same key + chunk index must always produce identical ciphertext"
+        );
     }
 }

@@ -106,7 +106,9 @@ mod tests {
         let hex_str = sha256_hex(b"test");
         assert_eq!(hex_str.len(), 64, "SHA-256 hex must be 64 characters");
         assert!(
-            hex_str.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            hex_str
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
             "SHA-256 hex must be lowercase hex [0-9a-f]"
         );
     }

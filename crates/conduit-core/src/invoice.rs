@@ -384,9 +384,7 @@ mod tests {
         let config = LightningConfig::default();
         assert_eq!(config.network, Network::Signet);
         assert_eq!(config.listening_port, 9735);
-        assert!(
-            matches!(&config.chain_source, ChainSource::Esplora(url) if !url.is_empty())
-        );
+        assert!(matches!(&config.chain_source, ChainSource::Esplora(url) if !url.is_empty()));
     }
 
     #[test]
@@ -397,9 +395,18 @@ mod tests {
         let h1 = payment_hash_for_key(&k1);
         let h2 = payment_hash_for_key(&k2);
         let h3 = payment_hash_for_key(&k3);
-        assert_ne!(h1, h2, "Different keys must produce different payment hashes");
-        assert_ne!(h2, h3, "Different keys must produce different payment hashes");
-        assert_ne!(h1, h3, "Different keys must produce different payment hashes");
+        assert_ne!(
+            h1, h2,
+            "Different keys must produce different payment hashes"
+        );
+        assert_ne!(
+            h2, h3,
+            "Different keys must produce different payment hashes"
+        );
+        assert_ne!(
+            h1, h3,
+            "Different keys must produce different payment hashes"
+        );
     }
 
     #[test]
@@ -424,7 +431,9 @@ mod tests {
         assert_eq!(config.storage_dir, "/custom/path");
         assert_eq!(config.network, Network::Bitcoin);
         assert_eq!(config.listening_port, 19735);
-        assert!(matches!(&config.chain_source, ChainSource::Esplora(url) if url == "https://example.com/api"));
+        assert!(
+            matches!(&config.chain_source, ChainSource::Esplora(url) if url == "https://example.com/api")
+        );
     }
 
     #[test]
@@ -441,6 +450,8 @@ mod tests {
             },
         };
         assert_eq!(config.listening_port, 29735);
-        assert!(matches!(&config.chain_source, ChainSource::BitcoindRpc { host, port, .. } if host == "127.0.0.1" && *port == 38332));
+        assert!(
+            matches!(&config.chain_source, ChainSource::BitcoindRpc { host, port, .. } if host == "127.0.0.1" && *port == 38332)
+        );
     }
 }
