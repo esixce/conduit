@@ -16,6 +16,7 @@ ExecStart=/root/conduit/target/release/conduit-setup \
   --public-ip 157.230.238.79 \
   --registry-url http://157.230.238.79:3003 \
   --dashboard /root/conduit/dashboard.html \
+  --ads-dir /var/lib/conduit-seeder2/ads \
   serve
 Restart=on-failure
 RestartSec=5
