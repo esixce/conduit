@@ -5,19 +5,10 @@
 # Prerequisites:
 #   1. Deploy the PRE-enabled conduit-setup to all nodes (push to main)
 #   2. Re-register content on the Creator node (to populate PRE fields)
-#   3. Ensure Buyer → Creator channel has outbound capacity
+#   3. Ensure Buyer -> Creator channel has outbound capacity
 #
 # Usage:
 #   ./scripts/test-pre-signet.sh
-#
-# What this script does:
-#   1. Checks Creator catalog for PRE-enabled content
-#   2. Generates a buyer PRE keypair locally
-#   3. Calls POST /api/pre-purchase/{content_hash} on Creator
-#   4. Calls POST /api/buy on Buyer with the returned invoice
-#   5. Waits for payment confirmation
-#   6. Fetches PRE ciphertext from Creator
-#   7. Locally re-encrypts and decrypts to verify the math
 #
 # Nodes (from docs/nodes.md):
 #   Creator:  http://167.172.152.231:3000
@@ -33,7 +24,7 @@ echo "=== PRE Signet E2E Test ==="
 echo ""
 
 # Step 1: Check Creator catalog for PRE-enabled content
-echo "[1/6] Checking Creator catalog..."
+echo "[1/7] Checking Creator catalog..."
 CATALOG=$(curl -sf "$CREATOR/api/catalog")
 FIRST_PRE=$(echo "$CATALOG" | python3 -c "
 import json, sys
@@ -62,76 +53,91 @@ PRICE=$(echo "$FIRST_PRE" | python3 -c "import json, sys; print(json.load(sys.st
 echo "       Found: $FILE_NAME ($PRICE sats) hash=$CONTENT_HASH"
 echo ""
 
-# Step 2: Generate buyer PRE keypair
-# For the live test, we need the buyer node to have a PRE keypair.
-# Since we can't run Rust code here, we use the buyer node's API.
-# The buyer's PRE keypair is derived from their storage seed, same as creator.
-echo "[2/6] Getting buyer PRE public key..."
-echo "       (NOTE: Buyer node must expose /api/pre-info endpoint after deployment)"
-echo "       For now, this step requires manual setup. Skipping to API test..."
+# Step 2: Get buyer's PRE public key from /api/pre-info
+echo "[2/7] Getting buyer PRE public key from /api/pre-info..."
+BUYER_PRE_INFO=$(curl -sf "$BUYER/api/pre-info")
+BUYER_PK_HEX=$(echo "$BUYER_PRE_INFO" | python3 -c "import json, sys; print(json.load(sys.stdin)['buyer_pk_hex'])")
+BUYER_ALIAS=$(echo "$BUYER_PRE_INFO" | python3 -c "import json, sys; print(json.load(sys.stdin).get('node_alias', 'unknown'))")
+echo "       Buyer alias: $BUYER_ALIAS"
+echo "       Buyer G2 pk: ${BUYER_PK_HEX:0:32}...${BUYER_PK_HEX: -16}"
 echo ""
 
-# Step 3: Test the /api/pre-ciphertext endpoint
-echo "[3/6] Fetching PRE ciphertext from Creator..."
+# Step 3: Fetch PRE ciphertext
+echo "[3/7] Fetching PRE ciphertext from Creator..."
 PRE_CT=$(curl -sf "$CREATOR/api/pre-ciphertext/$CONTENT_HASH" || echo "FAILED")
 
 if [ "$PRE_CT" = "FAILED" ]; then
     echo "ERROR: /api/pre-ciphertext/$CONTENT_HASH returned error."
-    echo "       Is the PRE code deployed?"
     exit 1
 fi
 
-echo "       PRE ciphertext retrieved successfully."
 C1_PREVIEW=$(echo "$PRE_CT" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['pre_c1_hex'][:32])")
 C2_PREVIEW=$(echo "$PRE_CT" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['pre_c2_hex'][:32])")
 echo "       c1: ${C1_PREVIEW}..."
 echo "       c2: ${C2_PREVIEW}..."
 echo ""
 
-# Step 4: Test the /api/pre-purchase endpoint (requires buyer pk)
-# This would normally be called by the buyer's client code.
-# For this test, we generate a dummy buyer pk to verify the API responds.
-echo "[4/6] Testing /api/pre-purchase endpoint..."
+# Step 4: Creator's /api/pre-info
+echo "[4/7] Getting Creator PRE public key..."
+CREATOR_PRE_INFO=$(curl -sf "$CREATOR/api/pre-info")
+CREATOR_PK_HEX=$(echo "$CREATOR_PRE_INFO" | python3 -c "import json, sys; print(json.load(sys.stdin)['buyer_pk_hex'])")
+echo "       Creator G2 pk: ${CREATOR_PK_HEX:0:32}...${CREATOR_PK_HEX: -16}"
+echo ""
 
-# Generate a test buyer pk (96 zero bytes = identity point, will fail validation)
-# A real test needs a valid G2 point from the buyer's PRE keypair.
-echo "       NOTE: Full purchase test requires deployed buyer with PRE support."
-echo "       Testing API availability..."
-
-HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+# Step 5: Test /api/pre-purchase with real buyer pk
+echo "[5/7] Testing /api/pre-purchase with buyer's real G2 pk..."
+PURCHASE_RESP=$(curl -sf \
     -X POST "$CREATOR/api/pre-purchase/$CONTENT_HASH" \
     -H "Content-Type: application/json" \
-    -d '{"buyer_pk_hex": "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"}')
+    -d "{\"buyer_pk_hex\": \"$BUYER_PK_HEX\"}" 2>&1 || echo "FAILED")
 
-if [ "$HTTP_STATUS" = "400" ]; then
-    echo "       /api/pre-purchase returned 400 (expected — invalid G2 point)"
-    echo "       Endpoint is live and validating input correctly."
-elif [ "$HTTP_STATUS" = "000" ]; then
-    echo "       Connection failed — is the Creator node running with PRE code?"
+if [ "$PURCHASE_RESP" = "FAILED" ]; then
+    echo "ERROR: /api/pre-purchase failed."
+    echo "       Check Creator logs for details."
     exit 1
-else
-    echo "       Unexpected status: $HTTP_STATUS"
 fi
+
+BOLT11=$(echo "$PURCHASE_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin)['bolt11'])" 2>/dev/null || echo "")
+RK_HEX=$(echo "$PURCHASE_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin)['rk_compressed_hex'])" 2>/dev/null || echo "")
+
+if [ -z "$BOLT11" ] || [ -z "$RK_HEX" ]; then
+    echo "ERROR: Pre-purchase response missing bolt11 or rk_compressed_hex."
+    echo "       Response: $PURCHASE_RESP"
+    exit 1
+fi
+
+echo "       Invoice received (length ${#BOLT11})"
+echo "       rk_compressed: ${RK_HEX:0:32}...${RK_HEX: -16}"
 echo ""
 
-# Step 5: Summary
-echo "[5/6] Local PRE crypto tests..."
-echo "       Run: cargo test -p conduit-core --test pre_e2e"
-echo "       Run: cargo test -p conduit-core --test pre_vectors"
+# Step 6: Show what the full payment test would look like
+echo "[6/7] Full Lightning payment test..."
+echo "       To complete the actual payment, run on buyer node:"
+echo ""
+echo "       conduit-setup buy-pre \\"
+echo "         --creator-url $CREATOR \\"
+echo "         --content-hash $CONTENT_HASH \\"
+echo "         --output /tmp/decrypted-output"
+echo ""
+echo "       This will:"
+echo "         1. Call /api/pre-purchase with buyer's G2 pk"
+echo "         2. Pay the Lightning invoice"
+echo "         3. Recover AES key m via PRE decryption"
+echo "         4. Download and decrypt chunks"
+echo "         5. Verify content hash"
 echo ""
 
-echo "[6/6] Summary"
+# Step 7: Summary
+echo "[7/7] Summary"
 echo "       Creator catalog:    PRE-enabled content found"
+echo "       Buyer /api/pre-info: Working (G2 pk exposed)"
+echo "       Creator /api/pre-info: Working"
 echo "       PRE ciphertext API: Working"
-echo "       PRE purchase API:   Working (input validation confirmed)"
+echo "       PRE purchase API:   Working (invoice + rk returned)"
 echo ""
-echo "=== To run the full payment test ==="
-echo "1. Deploy PRE code to all nodes (push to conduitp2p/conduit main)"
-echo "2. Re-register content on Creator:"
-echo "     curl -X DELETE $CREATOR/api/catalog"
-echo "     curl -X POST $CREATOR/api/register -H 'Content-Type: application/json' \\"
-echo "       -d '{\"file\": \"/tmp/sample-song.txt\", \"price\": 5}'"
-echo "3. Add /api/pre-info endpoint to buyer (returns buyer PRE public key)"
-echo "4. Run this script again — it will perform the full Lightning payment test."
+echo "       Buyer pk != Creator pk: $([ "$BUYER_PK_HEX" != "$CREATOR_PK_HEX" ] && echo "YES (correct)" || echo "NO (problem!)")"
 echo ""
-echo "=== Done ==="
+echo "=== PRE API Contract Verified ==="
+echo ""
+echo "Next: Run 'conduit-setup buy-pre' on the buyer node to perform"
+echo "the actual Lightning payment + PRE decryption test."
