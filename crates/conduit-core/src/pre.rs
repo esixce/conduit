@@ -403,6 +403,48 @@ pub fn payment_hash_for_rk(rk_result: &ReKeyResult) -> [u8; 32] {
 }
 
 // ---------------------------------------------------------------------------
+// Buyer-side full decryption (hex inputs)
+// ---------------------------------------------------------------------------
+
+/// Full buyer-side PRE decryption from hex-encoded API responses.
+///
+/// Takes the buyer's secret key plus the hex fields from the creator's
+/// `/api/pre-purchase` response:
+///   - `c1_hex`: 48 bytes (compressed G1 point)
+///   - `c2_hex`: 32 bytes
+///   - `rk_compressed_hex`: 96 bytes (compressed G2 point)
+///
+/// Returns the recovered AES key `m` (32 bytes), or `None` if any parse fails.
+pub fn buyer_decrypt_from_hex(
+    sk_buyer: &Scalar,
+    c1_hex: &str,
+    c2_hex: &str,
+    rk_compressed_hex: &str,
+) -> Option<[u8; 32]> {
+    // Parse rk
+    let rk_bytes = hex::decode(rk_compressed_hex).ok()?;
+    if rk_bytes.len() != 96 {
+        return None;
+    }
+    let mut rk_arr = [0u8; 96];
+    rk_arr.copy_from_slice(&rk_bytes);
+
+    // Parse c1, c2
+    let c1_bytes = hex::decode(c1_hex).ok()?;
+    let c2_bytes = hex::decode(c2_hex).ok()?;
+    let mut full = Vec::new();
+    full.extend_from_slice(&c1_bytes);
+    full.extend_from_slice(&c2_bytes);
+    let ct = deserialize_ciphertext(&full)?;
+
+    // Re-encrypt locally: c1' = e(c1, rk)
+    let re_ct = re_encrypt_from_bytes(&rk_arr, &ct)?;
+
+    // Decrypt: m = c2 XOR KDF(c1'^(1/b))
+    Some(decrypt(sk_buyer, &re_ct))
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -627,5 +669,42 @@ mod tests {
         let rk2 = re_keygen(&creator.sk, &buyer.pk);
         assert_eq!(rk.rk_compressed, rk2.rk_compressed);
         assert_eq!(rk.htlc_preimage, rk2.htlc_preimage);
+    }
+
+    #[test]
+    fn test_buyer_decrypt_from_hex_round_trip() {
+        let creator = creator_keygen_from_seed(&[0xAAu8; 32]);
+        let buyer = buyer_keygen_from_seed(&[0xBBu8; 32]);
+        let m = [0x42u8; 32];
+        let ct = encrypt(&creator.pk, &m);
+
+        // Serialize ciphertext
+        let serialized = serialize_ciphertext(&ct);
+        let c1_hex = hex::encode(&serialized[..48]);
+        let c2_hex = hex::encode(&serialized[48..]);
+
+        // Generate re-encryption key
+        let rk = re_keygen(&creator.sk, &buyer.pk);
+        let rk_hex = hex::encode(rk.rk_compressed);
+
+        // Buyer decrypts from hex (simulating API response)
+        let recovered = buyer_decrypt_from_hex(&buyer.sk, &c1_hex, &c2_hex, &rk_hex);
+        assert_eq!(recovered, Some(m), "buyer_decrypt_from_hex must recover m");
+    }
+
+    #[test]
+    fn test_buyer_decrypt_from_hex_bad_rk() {
+        let creator = creator_keygen_from_seed(&[0xCCu8; 32]);
+        let buyer = buyer_keygen_from_seed(&[0xDDu8; 32]);
+        let m = [0x99u8; 32];
+        let ct = encrypt(&creator.pk, &m);
+
+        let serialized = serialize_ciphertext(&ct);
+        let c1_hex = hex::encode(&serialized[..48]);
+        let c2_hex = hex::encode(&serialized[48..]);
+
+        // Bad rk (wrong length)
+        let result = buyer_decrypt_from_hex(&buyer.sk, &c1_hex, &c2_hex, "deadbeef");
+        assert_eq!(result, None, "Short rk must fail");
     }
 }
