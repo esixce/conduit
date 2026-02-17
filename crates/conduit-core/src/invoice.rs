@@ -30,6 +30,8 @@ pub enum InvoiceError {
     InvalidDescription(String),
     #[error("Payment failed: {0}")]
     PaymentFailed(String),
+    #[error("Node start error: {0}")]
+    NodeStart(String),
     #[error("Invoice parse error: {0}")]
     InvoiceParse(String),
 }
@@ -63,6 +65,8 @@ pub struct LightningConfig {
     pub listening_port: u16,
     /// Chain data source (Esplora or bitcoind RPC).
     pub chain_source: ChainSource,
+    /// Human-readable node alias (max 32 bytes UTF-8). Gossiped to the Lightning network.
+    pub node_alias: Option<String>,
 }
 
 impl Default for LightningConfig {
@@ -72,6 +76,7 @@ impl Default for LightningConfig {
             network: Network::Signet,
             listening_port: 9735,
             chain_source: ChainSource::Esplora("https://mempool.space/signet/api".into()),
+            node_alias: None,
         }
     }
 }
@@ -111,6 +116,12 @@ pub fn start_node(config: &LightningConfig) -> Result<Node, InvoiceError> {
 
     builder.set_network(config.network);
     builder.set_storage_dir_path(config.storage_dir.clone());
+
+    if let Some(ref alias) = config.node_alias {
+        builder
+            .set_node_alias(alias.clone())
+            .map_err(|e| InvoiceError::NodeStart(format!("Invalid node alias: {:?}", e)))?;
+    }
 
     match &config.chain_source {
         ChainSource::Esplora(url) => {
@@ -349,6 +360,113 @@ pub fn wait_for_outbound_payment(
 }
 
 // ---------------------------------------------------------------------------
+// PRE-aware invoice functions (Phase 2A)
+// ---------------------------------------------------------------------------
+
+/// Create a Lightning invoice where the preimage is the PRE HTLC preimage.
+///
+/// In the PRE flow, the preimage is `SHA-256(rk_compressed)` — the hash of
+/// the re-encryption key point. This 32-byte value fits the HTLC preimage
+/// slot. When the buyer pays, settlement reveals this preimage; the buyer
+/// uses it together with `rk_point` (received via the purchase API) to
+/// proceed with re-encryption and decryption.
+///
+/// Like [`create_invoice_for_key`], the payment is NOT auto-claimed.
+/// The caller must handle `PaymentClaimable` and call [`claim_payment_pre`].
+pub fn create_invoice_for_rk(
+    node: &Node,
+    htlc_preimage: &[u8; 32],
+    amount_sats: u64,
+    description: &str,
+) -> Result<String, InvoiceError> {
+    let preimage = PaymentPreimage(*htlc_preimage);
+    let payment_hash: PaymentHash = preimage.into();
+
+    let desc = Description::new(description.to_string())
+        .map_err(|e| InvoiceError::InvalidDescription(e.to_string()))?;
+    let invoice_desc = Bolt11InvoiceDescription::Direct(desc);
+
+    let amount_msat = amount_sats * 1000;
+    let expiry_secs = 3600;
+
+    let invoice = node.bolt11_payment().receive_for_hash(
+        amount_msat,
+        &invoice_desc,
+        expiry_secs,
+        payment_hash,
+    )?;
+
+    Ok(invoice.to_string())
+}
+
+/// Claim an inbound PRE payment after a `PaymentClaimable` event.
+///
+/// Identical to [`claim_payment`] but takes the HTLC preimage directly
+/// (instead of the AES key). In the PRE flow, the preimage is
+/// `SHA-256(rk_compressed)`.
+pub fn claim_payment_pre(
+    node: &Node,
+    htlc_preimage: &[u8; 32],
+    claimable_amount_msat: u64,
+) -> Result<(), InvoiceError> {
+    let preimage = PaymentPreimage(*htlc_preimage);
+    let payment_hash: PaymentHash = preimage.into();
+
+    node.bolt11_payment()
+        .claim_for_hash(payment_hash, claimable_amount_msat, preimage)?;
+
+    Ok(())
+}
+
+/// (Creator side) Wait for a PRE payment, claim it, then confirm receipt.
+///
+/// Same as [`wait_and_claim_payment`] but uses the PRE HTLC preimage.
+pub fn wait_and_claim_payment_pre(
+    node: &Node,
+    htlc_preimage: &[u8; 32],
+) -> Result<PaymentReceived, InvoiceError> {
+    let expected_hash: PaymentHash = PaymentPreimage(*htlc_preimage).into();
+
+    loop {
+        let event = node.wait_next_event();
+        match event {
+            Event::PaymentClaimable {
+                payment_hash,
+                claimable_amount_msat,
+                ..
+            } if payment_hash == expected_hash => {
+                node.event_handled()?;
+                claim_payment_pre(node, htlc_preimage, claimable_amount_msat)?;
+                break;
+            }
+            _ => {
+                node.event_handled()?;
+            }
+        }
+    }
+
+    loop {
+        let event = node.wait_next_event();
+        match event {
+            Event::PaymentReceived {
+                payment_hash,
+                amount_msat,
+                ..
+            } if payment_hash == expected_hash => {
+                node.event_handled()?;
+                return Ok(PaymentReceived {
+                    preimage: *htlc_preimage,
+                    amount_msat,
+                });
+            }
+            _ => {
+                node.event_handled()?;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Utility: compute payment hash from key (for buyer convenience)
 // ---------------------------------------------------------------------------
 
@@ -358,6 +476,15 @@ pub fn wait_for_outbound_payment(
 /// The buyer can use this to verify the invoice matches expectations.
 pub fn payment_hash_for_key(key: &[u8; 32]) -> [u8; 32] {
     verify::sha256_hash(key)
+}
+
+/// Compute the Lightning payment hash for a PRE HTLC preimage.
+///
+/// This is `SHA-256(htlc_preimage)` — the double-hash of the rk point.
+/// Alias for [`payment_hash_for_key`] since the operation is identical
+/// (SHA-256 of 32 bytes).
+pub fn payment_hash_for_rk(htlc_preimage: &[u8; 32]) -> [u8; 32] {
+    verify::sha256_hash(htlc_preimage)
 }
 
 // ---------------------------------------------------------------------------
@@ -427,6 +554,7 @@ mod tests {
             network: Network::Bitcoin,
             listening_port: 19735,
             chain_source: ChainSource::Esplora("https://example.com/api".into()),
+            node_alias: None,
         };
         assert_eq!(config.storage_dir, "/custom/path");
         assert_eq!(config.network, Network::Bitcoin);
@@ -448,6 +576,7 @@ mod tests {
                 user: "rpcuser".into(),
                 password: "rpcpass".into(),
             },
+            node_alias: None,
         };
         assert_eq!(config.listening_port, 29735);
         assert!(

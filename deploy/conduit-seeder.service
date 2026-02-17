@@ -16,6 +16,7 @@ ExecStart=/home/ubuntu/conduit/target/release/conduit-setup \
   --public-ip 54.89.56.74 \
   --registry-url http://157.230.238.79:3003 \
   --dashboard /home/ubuntu/conduit/dashboard.html \
+  --alias Seeder1 \
   serve
 Restart=on-failure
 RestartSec=5

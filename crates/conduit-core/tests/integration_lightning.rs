@@ -110,6 +110,7 @@ fn test_start_and_stop_node() {
         network: ldk_node::bitcoin::Network::Signet,
         listening_port: 19735,
         chain_source: test_chain_source(),
+        node_alias: None,
     };
 
     eprintln!("Starting node with storage: {}", storage);
@@ -160,6 +161,7 @@ fn test_create_invoice_payment_hash() {
         network: ldk_node::bitcoin::Network::Signet,
         listening_port: 19736,
         chain_source: test_chain_source(),
+        node_alias: None,
     };
 
     let node = invoice::start_node(&config).expect("node should start");
@@ -259,12 +261,14 @@ fn test_full_payment_cycle() {
         network: ldk_node::bitcoin::Network::Signet,
         listening_port: creator_port,
         chain_source: chain_source.clone(),
+        node_alias: None,
     };
     let buyer_config = LightningConfig {
         storage_dir: buyer_storage,
         network: ldk_node::bitcoin::Network::Signet,
         listening_port: buyer_port,
         chain_source,
+        node_alias: None,
     };
 
     eprintln!("Starting creator node...");
@@ -412,12 +416,14 @@ fn test_atomic_content_exchange() {
         network: ldk_node::bitcoin::Network::Signet,
         listening_port: creator_port,
         chain_source: chain_source.clone(),
+        node_alias: None,
     };
     let buyer_config = LightningConfig {
         storage_dir: buyer_storage,
         network: ldk_node::bitcoin::Network::Signet,
         listening_port: buyer_port,
         chain_source,
+        node_alias: None,
     };
 
     // ── Creator: prepare content ──────────────────────────────────────────
