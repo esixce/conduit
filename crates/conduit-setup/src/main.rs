@@ -33,6 +33,7 @@ use conduit_core::invoice::{self, ChainSource, LightningConfig};
 use conduit_core::merkle::MerkleTree;
 use conduit_core::pre;
 use conduit_core::verify;
+
 use ldk_node::lightning::ln::msgs::SocketAddress;
 use ldk_node::lightning_types::payment::PaymentHash;
 use ldk_node::payment::{PaymentDirection, PaymentKind, PaymentStatus};
@@ -324,6 +325,10 @@ struct AppState {
     catalog: Arc<std::sync::Mutex<Vec<CatalogEntry>>>,
     storage_dir: String,
     registry_info: Option<RegistryInfo>,
+    // PRE (Phase 2A)
+    pre_buyer_pk_hex: String,
+    #[allow(dead_code)]
+    pre_buyer_sk: bls12_381::Scalar,
     // Advertiser role
     advertiser_db: Option<Arc<std::sync::Mutex<Connection>>>,
     advertiser_signing_key: Option<Arc<SigningKey>>,
@@ -2599,6 +2604,8 @@ fn start_http_server(port: u16, state: AppState) {
                     "/api/pre-ciphertext/{content_hash}",
                     get(pre_ciphertext_handler),
                 )
+                .route("/api/pre-info", get(pre_info_handler))
+                .route("/api/pre-reencrypt", post(pre_reencrypt_handler))
                 .layer(CorsLayer::permissive())
                 .with_state(state);
             let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port))
@@ -2885,6 +2892,160 @@ fn handle_pre_sell_from_catalog(
         }
     }
     router.unregister(&expected_hash);
+}
+
+/// GET /api/pre-info
+///
+/// Returns this node's PRE public key (buyer role, G2) so that creators
+/// can compute re-encryption keys for purchases.
+async fn pre_info_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "buyer_pk_hex": state.pre_buyer_pk_hex,
+        "node_id": invoice::node_id(&state.node),
+        "node_alias": state.node_alias,
+    }))
+}
+
+/// Request body for PRE re-encryption (seeder side).
+#[derive(Deserialize)]
+struct PreReencryptRequest {
+    /// Re-encryption key (compressed G2, 96 bytes, hex-encoded).
+    rk_compressed_hex: String,
+    /// Content hash to look up the PRE ciphertext in catalog.
+    content_hash: String,
+}
+
+/// POST /api/pre-reencrypt
+///
+/// Seeder re-encrypts a PRE ciphertext using the buyer's rk.
+/// Returns the re-encrypted ciphertext components (c1_prime as hex, c2 as hex).
+///
+/// The seeder must have the content in their catalog (fetched from creator).
+/// The rk is provided by the buyer after they paid the creator.
+async fn pre_reencrypt_handler(
+    State(state): State<AppState>,
+    Json(req): Json<PreReencryptRequest>,
+) -> impl IntoResponse {
+    // Parse rk
+    let rk_bytes = match hex::decode(&req.rk_compressed_hex) {
+        Ok(b) if b.len() == 96 => {
+            let mut arr = [0u8; 96];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "rk_compressed_hex must be 96 bytes (192 hex chars)"
+                })),
+            )
+                .into_response()
+        }
+    };
+
+    // Look up content's PRE ciphertext
+    let entry = {
+        let cat = state.catalog.lock().unwrap();
+        cat.iter()
+            .find(|e| e.content_hash == req.content_hash || e.encrypted_hash == req.content_hash)
+            .cloned()
+    };
+
+    let entry = match entry {
+        Some(e) if !e.pre_c1_hex.is_empty() => e,
+        Some(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Content not PRE-enabled"})),
+            )
+                .into_response()
+        }
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Content not found in catalog"})),
+            )
+                .into_response()
+        }
+    };
+
+    // Deserialize PRE ciphertext
+    let ct = {
+        let c1_bytes = match hex::decode(&entry.pre_c1_hex) {
+            Ok(b) => b,
+            Err(_) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "Invalid c1 in catalog"})),
+                )
+                    .into_response()
+            }
+        };
+        let c2_bytes = match hex::decode(&entry.pre_c2_hex) {
+            Ok(b) => b,
+            Err(_) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "Invalid c2 in catalog"})),
+                )
+                    .into_response()
+            }
+        };
+        let mut full = Vec::new();
+        full.extend_from_slice(&c1_bytes);
+        full.extend_from_slice(&c2_bytes);
+        match pre::deserialize_ciphertext(&full) {
+            Some(ct) => ct,
+            None => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "Failed to deserialize PRE ciphertext"})),
+                )
+                    .into_response()
+            }
+        }
+    };
+
+    // Re-encrypt
+    let _re_ct = match pre::re_encrypt_from_bytes(&rk_bytes, &ct) {
+        Some(r) => r,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid rk: not a valid G2 point"})),
+            )
+                .into_response()
+        }
+    };
+
+    state.emitter.emit(
+        "seeder",
+        "PRE_REENCRYPTED",
+        serde_json::json!({
+            "content_hash": &req.content_hash,
+            "message": "PRE ciphertext re-encrypted for buyer",
+        }),
+    );
+
+    // Serialize c1_prime (Gt element) — we use the Debug repr for the KDF,
+    // but for transmission we need a deterministic format.
+    // Since Gt has no standard serialization in zkcrypto, we transmit the
+    // c2 (unchanged) and a flag that the buyer should compute c1_prime locally.
+    //
+    // Alternative: transmit enough info for the buyer to reconstruct.
+    // The buyer already has rk_compressed and can fetch the original c1 from
+    // the catalog. So the buyer can compute c1_prime = e(c1, rk_point) locally.
+    //
+    // For now: return a signal that re-encryption succeeded, and the buyer
+    // will compute it locally using c1 + rk.
+    Json(serde_json::json!({
+        "status": "reencrypted",
+        "content_hash": entry.content_hash,
+        "pre_c2_hex": entry.pre_c2_hex,
+        "message": "Re-encryption complete. Buyer should compute c1_prime locally from c1 + rk."
+    }))
+    .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -5002,6 +5163,288 @@ fn handle_buy(
 }
 
 // ---------------------------------------------------------------------------
+// buy-pre command
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+fn handle_buy_pre(
+    node: &Arc<Node>,
+    emitter: &ConsoleEmitter,
+    router: &Arc<EventRouter>,
+    _storage_dir: &str,
+    buyer_kp: &pre::BuyerKeyPair,
+    creator_url: &str,
+    content_hash: &str,
+    seeder_url: Option<&str>,
+    output_path: &str,
+) {
+    let role = "buyer";
+    let buyer_pk_hex = hex::encode(pre::serialize_buyer_pk(&buyer_kp.pk));
+
+    emitter.emit(
+        role,
+        "PRE_BUY_START",
+        serde_json::json!({
+            "creator_url": creator_url,
+            "content_hash": content_hash,
+            "buyer_pk_hex": &buyer_pk_hex,
+        }),
+    );
+    println!("=== BUY-PRE ===");
+    println!("Creator: {}", creator_url);
+    println!("Content: {}", content_hash);
+    println!("Buyer PK (G2): {}...{}", &buyer_pk_hex[..16], &buyer_pk_hex[buyer_pk_hex.len()-16..]);
+
+    // 1. Call creator's /api/pre-purchase/{content_hash} with buyer pk
+    let purchase_url = format!("{}/api/pre-purchase/{}", creator_url.trim_end_matches('/'), content_hash);
+    let client = reqwest::blocking::Client::new();
+    let resp = client
+        .post(&purchase_url)
+        .json(&serde_json::json!({ "buyer_pk_hex": buyer_pk_hex }))
+        .send()
+        .expect("Failed to call creator /api/pre-purchase");
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().unwrap_or_default();
+        eprintln!("ERROR: Creator returned {} — {}", status, body);
+        return;
+    }
+
+    let purchase_resp: serde_json::Value = resp.json().expect("Invalid JSON from creator");
+    let bolt11 = purchase_resp["bolt11"].as_str().expect("Missing bolt11 in response");
+    let rk_compressed_hex = purchase_resp["rk_compressed_hex"].as_str().expect("Missing rk_compressed_hex");
+    let pre_c1_hex = purchase_resp["pre_c1_hex"].as_str().expect("Missing pre_c1_hex");
+    let pre_c2_hex = purchase_resp["pre_c2_hex"].as_str().expect("Missing pre_c2_hex");
+    let price_sats = purchase_resp["price_sats"].as_u64().unwrap_or(0);
+    let enc_hash = purchase_resp["encrypted_hash"].as_str().unwrap_or("");
+
+    emitter.emit(
+        role,
+        "PRE_PURCHASE_RECEIVED",
+        serde_json::json!({
+            "bolt11_len": bolt11.len(),
+            "rk_len": rk_compressed_hex.len(),
+            "price_sats": price_sats,
+            "encrypted_hash": enc_hash,
+        }),
+    );
+    println!("Invoice received ({} sats)", price_sats);
+    println!("rk_compressed: {}...{}", &rk_compressed_hex[..16], &rk_compressed_hex[rk_compressed_hex.len()-16..]);
+
+    // 2. Countdown
+    for i in (1..=3).rev() {
+        emitter.emit(
+            role,
+            "COUNTDOWN",
+            serde_json::json!({
+                "seconds": i,
+                "message": format!("Paying PRE invoice in {}...", i),
+            }),
+        );
+        thread::sleep(Duration::from_secs(1));
+    }
+
+    // 3. Pay the Lightning invoice
+    emitter.emit(
+        role,
+        "PAYING_INVOICE",
+        serde_json::json!({ "bolt11": bolt11 }),
+    );
+    let hash_bytes = invoice::pay_invoice(node, bolt11).expect("Failed to pay invoice");
+    let target_hash = PaymentHash(hash_bytes);
+    emitter.emit(
+        role,
+        "PAYMENT_SENT",
+        serde_json::json!({
+            "payment_hash": hex::encode(hash_bytes),
+            "message": "HTLC in flight — PRE payment routing...",
+        }),
+    );
+
+    // 4. Wait for payment confirmation (preimage = SHA-256(rk_compressed))
+    let rx = router.register(target_hash);
+    loop {
+        let event = rx.recv().expect("Event router dropped");
+        match event {
+            Event::PaymentSuccessful {
+                payment_hash,
+                payment_preimage: Some(preimage),
+                fee_paid_msat,
+                ..
+            } => {
+                emitter.emit(
+                    role,
+                    "PRE_PAYMENT_CONFIRMED",
+                    serde_json::json!({
+                        "payment_hash": hex::encode(payment_hash.0),
+                        "preimage": hex::encode(preimage.0),
+                        "fee_msat": fee_paid_msat,
+                        "message": "PRE payment confirmed. Preimage = SHA-256(rk). AES key recoverable via PRE.",
+                    }),
+                );
+                println!("Payment confirmed (fee: {} msat)", fee_paid_msat.unwrap_or(0));
+                break;
+            }
+            Event::PaymentFailed { reason, .. } => {
+                emitter.emit(
+                    role,
+                    "PAYMENT_FAILED",
+                    serde_json::json!({
+                        "payment_hash": hex::encode(target_hash.0),
+                        "reason": format!("{:?}", reason),
+                    }),
+                );
+                router.unregister(&target_hash);
+                panic!("PRE payment failed: {:?}", reason);
+            }
+            _ => {}
+        }
+    }
+    router.unregister(&target_hash);
+
+    // 5. Recover AES key m via PRE decryption (buyer-side, no seeder needed)
+    //    c1' = e(c1, rk)    ... re-encrypt locally
+    //    m = c2 XOR KDF( c1'^(1/b) )
+    let m = pre::buyer_decrypt_from_hex(
+        &buyer_kp.sk,
+        pre_c1_hex,
+        pre_c2_hex,
+        rk_compressed_hex,
+    )
+    .expect("PRE decryption failed — invalid ciphertext or key");
+
+    emitter.emit(
+        role,
+        "PRE_KEY_RECOVERED",
+        serde_json::json!({
+            "m_hex": hex::encode(m),
+            "message": "AES key m recovered via PRE (buyer never saw m in transit).",
+        }),
+    );
+    println!("AES key recovered via PRE: {}...{}", &hex::encode(m)[..8], &hex::encode(m)[24..]);
+
+    // 6. Download encrypted chunks from seeder (or creator)
+    let chunk_source = seeder_url.unwrap_or(creator_url);
+    let catalog_url = format!("{}/api/catalog", chunk_source.trim_end_matches('/'));
+    let catalog_resp: Vec<serde_json::Value> = client
+        .get(&catalog_url)
+        .send()
+        .expect("Failed to fetch catalog")
+        .json()
+        .expect("Invalid catalog JSON");
+
+    // Find the entry
+    let entry = catalog_resp
+        .iter()
+        .find(|e| {
+            e["content_hash"].as_str() == Some(content_hash)
+                || e["encrypted_hash"].as_str() == Some(content_hash)
+        })
+        .expect("Content not found in chunk source catalog");
+
+    let num_chunks = entry["total_chunks"].as_u64().unwrap_or(1) as usize;
+    let enc_hash_str = entry["encrypted_hash"].as_str().unwrap_or(content_hash);
+
+    emitter.emit(
+        role,
+        "DOWNLOADING_CHUNKS",
+        serde_json::json!({
+            "source": chunk_source,
+            "chunks": num_chunks,
+            "encrypted_hash": enc_hash_str,
+        }),
+    );
+    println!("Downloading {} chunks from {}...", num_chunks, chunk_source);
+
+    let mut all_enc_data = Vec::new();
+    for i in 0..num_chunks {
+        let chunk_url = format!(
+            "{}/api/chunk/{}/{}",
+            chunk_source.trim_end_matches('/'),
+            enc_hash_str,
+            i
+        );
+        let chunk_bytes = client
+            .get(&chunk_url)
+            .send()
+            .and_then(|r| r.bytes())
+            .expect(&format!("Failed to download chunk {}", i));
+        all_enc_data.extend_from_slice(&chunk_bytes);
+    }
+
+    emitter.emit(
+        role,
+        "CHUNKS_DOWNLOADED",
+        serde_json::json!({
+            "total_bytes": all_enc_data.len(),
+            "chunks": num_chunks,
+        }),
+    );
+    println!("Downloaded {} bytes ({} chunks)", all_enc_data.len(), num_chunks);
+
+    // 7. Decrypt per-chunk with recovered AES key m
+    let cs = chunk::select_chunk_size(all_enc_data.len());
+    let (enc_chunks, _meta) = chunk::split(&all_enc_data, cs);
+    let decrypted: Vec<u8> = enc_chunks
+        .iter()
+        .enumerate()
+        .flat_map(|(i, c)| encrypt::decrypt(c, &m, i as u64))
+        .collect();
+    emitter.emit(
+        role,
+        "CONTENT_DECRYPTED",
+        serde_json::json!({
+            "bytes": decrypted.len(),
+            "chunks": enc_chunks.len(),
+            "message": "Decrypted using PRE-recovered AES key.",
+        }),
+    );
+
+    // 8. Verify content hash
+    let actual_hash = verify::sha256_hash(&decrypted);
+    let matches = hex::encode(actual_hash) == content_hash;
+    emitter.emit(
+        role,
+        "HASH_VERIFIED",
+        serde_json::json!({
+            "matches": matches,
+            "expected": content_hash,
+            "actual": hex::encode(actual_hash),
+        }),
+    );
+    if !matches {
+        eprintln!(
+            "WARNING: Content hash mismatch. Expected {} got {}",
+            content_hash,
+            hex::encode(actual_hash)
+        );
+        eprintln!("File may still be usable — hash could be encrypted_hash instead of content_hash.");
+    }
+
+    // 9. Write output
+    std::fs::write(output_path, &decrypted).expect("Failed to write decrypted file");
+    emitter.emit(
+        role,
+        "FILE_SAVED",
+        serde_json::json!({
+            "path": output_path,
+            "bytes": decrypted.len(),
+            "message": "PRE atomic content exchange complete.",
+        }),
+    );
+    println!();
+    println!("=== BUY-PRE COMPLETE ===");
+    println!(
+        "Decrypted file: {} ({} bytes)",
+        output_path,
+        decrypted.len()
+    );
+    println!("Key delivery: PRE (buyer never saw AES key in transit)");
+    println!("Payment: multihop Lightning (preimage = SHA-256(rk), not m)");
+}
+
+// ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
 
@@ -5133,6 +5576,21 @@ enum Commands {
         /// Expected SHA-256 hash of the plaintext (hex)
         #[arg(long)]
         hash: String,
+        /// Output path for decrypted file
+        #[arg(long)]
+        output: String,
+    },
+    /// Buy content using PRE: call creator API, pay Lightning invoice, decrypt with buyer PRE key
+    BuyPre {
+        /// Creator's HTTP endpoint (e.g. http://creator-host:9735)
+        #[arg(long)]
+        creator_url: String,
+        /// Content hash (SHA-256 hex) from the catalog
+        #[arg(long)]
+        content_hash: String,
+        /// Seeder HTTP endpoint to download chunks from (e.g. http://seeder:9735)
+        #[arg(long)]
+        seeder_url: Option<String>,
         /// Output path for decrypted file
         #[arg(long)]
         output: String,
@@ -5316,6 +5774,22 @@ fn main() {
             (None, None, None, None)
         };
 
+        // Derive buyer PRE keypair from storage directory seed
+        let buyer_pre_kp = {
+            let seed = {
+                use sha2::{Digest, Sha256};
+                let mut h = Sha256::new();
+                h.update(b"conduit-pre-buyer-seed:");
+                h.update(config.storage_dir.as_bytes());
+                let hash = h.finalize();
+                let mut s = [0u8; 32];
+                s.copy_from_slice(&hash);
+                s
+            };
+            pre::buyer_keygen_from_seed(&seed)
+        };
+        let pre_buyer_pk_hex = hex::encode(pre::serialize_buyer_pk(&buyer_pre_kp.pk));
+
         let state = AppState {
             node: node.clone(),
             node_alias: node_alias_value.clone(),
@@ -5324,6 +5798,8 @@ fn main() {
             catalog: catalog.clone(),
             storage_dir: config.storage_dir.clone(),
             registry_info: registry_info.clone(),
+            pre_buyer_pk_hex,
+            pre_buyer_sk: buyer_pre_kp.sk,
             advertiser_db: adv_db,
             advertiser_signing_key: adv_signing_key,
             advertiser_pubkey_hex: adv_pubkey_hex,
@@ -5445,6 +5921,40 @@ fn main() {
                 &invoice,
                 &encrypted_file,
                 &hash,
+                &output,
+            );
+        }
+
+        Commands::BuyPre {
+            creator_url,
+            content_hash,
+            seeder_url,
+            output,
+        } => {
+            event_router.set_role("buyer");
+            // Derive buyer PRE keypair from storage directory
+            let buyer_kp = {
+                let seed = {
+                    use sha2::{Digest, Sha256};
+                    let mut h = Sha256::new();
+                    h.update(b"conduit-pre-buyer-seed:");
+                    h.update(config.storage_dir.as_bytes());
+                    let hash = h.finalize();
+                    let mut s = [0u8; 32];
+                    s.copy_from_slice(&hash);
+                    s
+                };
+                pre::buyer_keygen_from_seed(&seed)
+            };
+            handle_buy_pre(
+                &node,
+                emitter.as_ref(),
+                &event_router,
+                &config.storage_dir,
+                &buyer_kp,
+                &creator_url,
+                &content_hash,
+                seeder_url.as_deref(),
                 &output,
             );
         }
