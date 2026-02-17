@@ -1001,6 +1001,9 @@ async fn catalog_handler(State(state): State<AppState>) -> Json<serde_json::Valu
                 "chunk_count": e.chunk_count,
                 "plaintext_root": e.plaintext_root,
                 "encrypted_root": e.encrypted_root,
+                "pre_c1_hex": e.pre_c1_hex,
+                "pre_c2_hex": e.pre_c2_hex,
+                "pre_pk_creator_hex": e.pre_pk_creator_hex,
             })
         })
         .collect();
