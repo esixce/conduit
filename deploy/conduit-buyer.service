@@ -16,6 +16,7 @@ ExecStart=/root/conduit/target/release/conduit-setup \
   --public-ip 192.34.58.149 \
   --registry-url http://157.230.238.79:3003 \
   --dashboard /root/conduit/dashboard.html \
+  --alias Buyer \
   serve
 Restart=on-failure
 RestartSec=5

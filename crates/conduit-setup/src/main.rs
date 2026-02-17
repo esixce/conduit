@@ -31,6 +31,7 @@ use conduit_core::chunk;
 use conduit_core::encrypt;
 use conduit_core::invoice::{self, ChainSource, LightningConfig};
 use conduit_core::merkle::MerkleTree;
+use conduit_core::pre;
 use conduit_core::verify;
 use ldk_node::lightning::ln::msgs::SocketAddress;
 use ldk_node::lightning_types::payment::PaymentHash;
@@ -306,6 +307,8 @@ struct RegistryInfo {
     http_address: String,
     /// This node's Lightning listening address (e.g. "1.2.3.4:9735")
     ln_address: String,
+    /// Human-readable alias for this node
+    node_alias: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -315,6 +318,7 @@ struct RegistryInfo {
 #[derive(Clone)]
 struct AppState {
     node: Arc<Node>,
+    node_alias: String,
     emitter: Arc<ConsoleEmitter>,
     event_router: Arc<EventRouter>,
     catalog: Arc<std::sync::Mutex<Vec<CatalogEntry>>>,
@@ -351,6 +355,7 @@ async fn index_handler(State(state): State<AppState>) -> impl IntoResponse {
 #[derive(Serialize)]
 struct NodeInfo {
     node_id: String,
+    node_alias: String,
     onchain_balance_sats: u64,
     spendable_onchain_sats: u64,
     lightning_balance_sats: u64,
@@ -359,6 +364,8 @@ struct NodeInfo {
 
 #[derive(Serialize)]
 struct ChannelInfo {
+    channel_id: String,
+    counterparty_node_id: String,
     value_sats: u64,
     outbound_msat: u64,
     inbound_msat: u64,
@@ -373,6 +380,8 @@ async fn info_handler(State(state): State<AppState>) -> Json<NodeInfo> {
         .list_channels()
         .iter()
         .map(|ch| ChannelInfo {
+            channel_id: ch.channel_id.to_string(),
+            counterparty_node_id: ch.counterparty_node_id.to_string(),
             value_sats: ch.channel_value_sats,
             outbound_msat: ch.outbound_capacity_msat,
             inbound_msat: ch.inbound_capacity_msat,
@@ -382,6 +391,7 @@ async fn info_handler(State(state): State<AppState>) -> Json<NodeInfo> {
         .collect();
     Json(NodeInfo {
         node_id: invoice::node_id(&state.node),
+        node_alias: state.node_alias.clone(),
         onchain_balance_sats: balance.total_onchain_balance_sats,
         spendable_onchain_sats: balance.spendable_onchain_balance_sats,
         lightning_balance_sats: balance.total_lightning_balance_sats,
@@ -518,6 +528,13 @@ struct CatalogEntry {
     encrypted_root: String, // Merkle root of H(encrypted chunks), hex
     #[serde(default)]
     chunks_held: Vec<usize>, // which chunk indices this node has (empty = all)
+    // --- PRE (Phase 2A) ---
+    #[serde(default)]
+    pre_c1_hex: String, // PRE ciphertext c1 (compressed G1, 48 bytes, hex)
+    #[serde(default)]
+    pre_c2_hex: String, // PRE ciphertext c2 (m XOR mask, 32 bytes, hex)
+    #[serde(default)]
+    pre_pk_creator_hex: String, // Creator's PRE public key (compressed G1, 48 bytes, hex)
 }
 
 #[derive(Deserialize)]
@@ -740,6 +757,9 @@ fn resync_stale_seeds(
             plaintext_root: String::new(),
             encrypted_root: hex::encode(enc_tree.root()),
             chunks_held: Vec::new(),
+            pre_c1_hex: String::new(),
+            pre_c2_hex: String::new(),
+            pre_pk_creator_hex: String::new(),
         };
 
         {
@@ -754,6 +774,7 @@ fn resync_stale_seeds(
             "seeder_pubkey": &registry_info.node_pubkey,
             "seeder_address": &registry_info.http_address,
             "seeder_ln_address": &registry_info.ln_address,
+            "seeder_alias": &registry_info.node_alias,
             "transport_price": transport_price,
             "chunk_count": meta.count,
             "chunks_held": Vec::<usize>::new(),
@@ -2566,6 +2587,15 @@ fn start_http_server(port: u16, state: AppState) {
                 )
                 .route("/api/campaigns/pay", post(adv_pay_invoice))
                 .route("/api/advertiser/info", get(adv_info_handler))
+                // PRE (Phase 2A) routes
+                .route(
+                    "/api/pre-purchase/{content_hash}",
+                    post(pre_purchase_handler),
+                )
+                .route(
+                    "/api/pre-ciphertext/{content_hash}",
+                    get(pre_ciphertext_handler),
+                )
                 .layer(CorsLayer::permissive())
                 .with_state(state);
             let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port))
@@ -2575,6 +2605,283 @@ fn start_http_server(port: u16, state: AppState) {
             axum::serve(listener, app).await.unwrap();
         });
     });
+}
+
+// ---------------------------------------------------------------------------
+// PRE (Phase 2A) API handlers
+// ---------------------------------------------------------------------------
+
+/// Request body for PRE purchase: buyer sends their PRE public key (G2, 96 bytes hex).
+#[derive(Deserialize)]
+struct PrePurchaseRequest {
+    /// Buyer's PRE public key (compressed G2, 96 bytes, hex-encoded).
+    buyer_pk_hex: String,
+}
+
+/// POST /api/pre-purchase/{content_hash}
+///
+/// PRE purchase flow:
+/// 1. Buyer sends their G2 public key
+/// 2. Creator computes rk = re_keygen(sk_creator, pk_buyer)
+/// 3. Creator creates Lightning invoice with HTLC preimage = SHA-256(rk_compressed)
+/// 4. Returns: invoice, rk_compressed (hex), payment_hash, PRE ciphertext
+///
+/// After buyer pays the invoice, they receive the HTLC preimage. They already
+/// have rk_compressed from this response, plus the PRE ciphertext from
+/// GET /api/pre-ciphertext/{content_hash}. They can now:
+/// - Send rk_compressed to the seeder for re-encryption
+/// - Decrypt the re-encrypted ciphertext with their own sk_buyer
+/// - Recover the AES key m
+async fn pre_purchase_handler(
+    State(state): State<AppState>,
+    AxumPath(content_hash): AxumPath<String>,
+    Json(req): Json<PrePurchaseRequest>,
+) -> impl IntoResponse {
+    // Look up catalog entry
+    let entry = {
+        let cat = state.catalog.lock().unwrap();
+        cat.iter().find(|e| e.content_hash == content_hash).cloned()
+    };
+
+    let entry = match entry {
+        Some(e) if !e.pre_c1_hex.is_empty() => e,
+        Some(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "Content not PRE-enabled (registered before PRE was active)"
+                })),
+            )
+                .into_response()
+        }
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": "Content not found in catalog"
+                })),
+            )
+                .into_response()
+        }
+    };
+
+    // Parse buyer's G2 public key
+    let buyer_pk_bytes = match hex::decode(&req.buyer_pk_hex) {
+        Ok(b) if b.len() == 96 => {
+            let mut arr = [0u8; 96];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "buyer_pk_hex must be 96 bytes (192 hex chars), compressed G2 point"
+                })),
+            )
+                .into_response()
+        }
+    };
+
+    let buyer_pk = match pre::deserialize_buyer_pk(&buyer_pk_bytes) {
+        Some(pk) => pk,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "Invalid G2 point: buyer_pk_hex is not a valid compressed BLS12-381 G2 point"
+                })),
+            )
+                .into_response()
+        }
+    };
+
+    // Derive creator PRE keypair (same seed as handle_register)
+    let pre_seed = {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(b"conduit-pre-creator-seed:");
+        h.update(state.storage_dir.as_bytes());
+        let hash = h.finalize();
+        let mut s = [0u8; 32];
+        s.copy_from_slice(&hash);
+        s
+    };
+    let creator_kp = pre::creator_keygen_from_seed(&pre_seed);
+
+    // Compute re-encryption key
+    let rk = pre::re_keygen(&creator_kp.sk, &buyer_pk);
+
+    // Create Lightning invoice with PRE preimage
+    let bolt11 = match invoice::create_invoice_for_rk(
+        &state.node,
+        &rk.htlc_preimage,
+        entry.price_sats,
+        &format!("PRE:{}", entry.file_name),
+    ) {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("Failed to create invoice: {}", e)
+                })),
+            )
+                .into_response()
+        }
+    };
+
+    let payment_hash = hex::encode(invoice::payment_hash_for_rk(&rk.htlc_preimage));
+    let rk_compressed_hex = hex::encode(rk.rk_compressed);
+
+    let emitter = state.emitter.clone();
+    emitter.emit(
+        "creator",
+        "PRE_INVOICE_CREATED",
+        serde_json::json!({
+            "payment_hash": &payment_hash,
+            "content_hash": &entry.content_hash,
+            "buyer_pk": &req.buyer_pk_hex,
+            "rk_compressed": &rk_compressed_hex,
+            "amount_sats": entry.price_sats,
+            "message": "PRE invoice created — waiting for buyer payment",
+        }),
+    );
+
+    // Spawn thread to wait for payment and claim it
+    let node = state.node.clone();
+    let emitter2 = state.emitter.clone();
+    let router = state.event_router.clone();
+    let preimage = rk.htlc_preimage;
+    thread::spawn(move || {
+        handle_pre_sell_from_catalog(&node, &emitter2, &router, &preimage);
+    });
+
+    Json(serde_json::json!({
+        "bolt11": bolt11,
+        "payment_hash": payment_hash,
+        "rk_compressed_hex": rk_compressed_hex,
+        "content_hash": entry.content_hash,
+        "encrypted_hash": entry.encrypted_hash,
+        "pre_c1_hex": entry.pre_c1_hex,
+        "pre_c2_hex": entry.pre_c2_hex,
+        "pre_pk_creator_hex": entry.pre_pk_creator_hex,
+        "price_sats": entry.price_sats,
+        "file_name": entry.file_name,
+        "size_bytes": entry.size_bytes,
+    }))
+    .into_response()
+}
+
+/// GET /api/pre-ciphertext/{content_hash}
+///
+/// Returns the PRE ciphertext components (c1, c2) and creator's PRE public key
+/// for a given content. Seeders fetch this to perform re-encryption.
+async fn pre_ciphertext_handler(
+    State(state): State<AppState>,
+    AxumPath(content_hash): AxumPath<String>,
+) -> impl IntoResponse {
+    let entry = {
+        let cat = state.catalog.lock().unwrap();
+        cat.iter().find(|e| e.content_hash == content_hash).cloned()
+    };
+
+    match entry {
+        Some(e) if !e.pre_c1_hex.is_empty() => Json(serde_json::json!({
+            "content_hash": e.content_hash,
+            "pre_c1_hex": e.pre_c1_hex,
+            "pre_c2_hex": e.pre_c2_hex,
+            "pre_pk_creator_hex": e.pre_pk_creator_hex,
+        }))
+        .into_response(),
+        Some(_) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "Content not PRE-enabled"
+            })),
+        )
+            .into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "Content not found"
+            })),
+        )
+            .into_response(),
+    }
+}
+
+/// Wait for a PRE payment, claim it, then confirm receipt (creator side).
+fn handle_pre_sell_from_catalog(
+    node: &Arc<Node>,
+    emitter: &ConsoleEmitter,
+    router: &Arc<EventRouter>,
+    htlc_preimage: &[u8; 32],
+) {
+    let role = "creator";
+
+    emitter.emit(
+        role,
+        "PRE_WAITING_FOR_PAYMENT",
+        serde_json::json!({
+            "message": "Listening for incoming PRE HTLC..."
+        }),
+    );
+
+    let payment_hash = verify::sha256_hash(htlc_preimage);
+    let expected_hash = PaymentHash(payment_hash);
+    let rx = router.register(expected_hash);
+
+    loop {
+        let event = rx.recv().expect("Event router dropped");
+        match event {
+            Event::PaymentClaimable {
+                payment_hash: hash,
+                claimable_amount_msat,
+                claim_deadline,
+                ..
+            } => {
+                emitter.emit(
+                    role,
+                    "PRE_HTLC_RECEIVED",
+                    serde_json::json!({
+                        "payment_hash": hex::encode(hash.0),
+                        "amount_msat": claimable_amount_msat,
+                        "claim_deadline": claim_deadline,
+                    }),
+                );
+
+                invoice::claim_payment_pre(node, htlc_preimage, claimable_amount_msat)
+                    .expect("Failed to claim PRE payment");
+                emitter.emit(
+                    role,
+                    "PRE_PAYMENT_CLAIMED",
+                    serde_json::json!({
+                        "preimage": hex::encode(htlc_preimage),
+                        "message": "PRE preimage revealed to buyer via HTLC settlement",
+                    }),
+                );
+            }
+            Event::PaymentReceived {
+                payment_hash: hash,
+                amount_msat,
+                ..
+            } => {
+                emitter.emit(
+                    role,
+                    "PRE_PAYMENT_RECEIVED",
+                    serde_json::json!({
+                        "payment_hash": hex::encode(hash.0),
+                        "amount_msat": amount_msat,
+                        "message": "PRE payment confirmed. Content sold via PRE.",
+                    }),
+                );
+                break;
+            }
+            _ => {}
+        }
+    }
+    router.unregister(&expected_hash);
 }
 
 // ---------------------------------------------------------------------------
@@ -2868,21 +3175,24 @@ fn handle_seed(
     };
 
     let entry = CatalogEntry {
-        content_hash: String::new(), // seeder doesn't know H(F)
+        content_hash: String::new(),
         file_name: file_name.clone(),
-        file_path: String::new(), // seeder doesn't have plaintext
+        file_path: String::new(),
         enc_file_path: enc_file_path.to_string(),
-        key_hex: String::new(), // seeder doesn't have K
-        price_sats: 0,          // seeder doesn't set content price
+        key_hex: String::new(),
+        price_sats: 0,
         encrypted_hash: expected_enc_hash_hex.to_string(),
         size_bytes: encrypted.len() as u64,
         registered_at: registered_at.clone(),
         transport_price,
         chunk_size: meta.chunk_size,
         chunk_count: meta.count,
-        plaintext_root: String::new(), // seeder doesn't know plaintext root
+        plaintext_root: String::new(),
         encrypted_root: hex::encode(enc_tree.root()),
         chunks_held: chunks_held.clone(),
+        pre_c1_hex: String::new(),
+        pre_c2_hex: String::new(),
+        pre_pk_creator_hex: String::new(),
     };
 
     {
@@ -2915,6 +3225,7 @@ fn handle_seed(
             "seeder_pubkey": &info.node_pubkey,
             "seeder_address": &info.http_address,
             "seeder_ln_address": &info.ln_address,
+            "seeder_alias": &info.node_alias,
             "transport_price": transport_price,
             "chunk_count": meta.count,
             "chunks_held": &chunks_held,
@@ -2944,6 +3255,19 @@ fn handle_register(
     price: u64,
     registry_info: &Option<RegistryInfo>,
 ) {
+    // Derive creator PRE keypair from a seed stored alongside the catalog.
+    // For the prototype, we use a fixed seed based on the storage directory.
+    let pre_seed = {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(b"conduit-pre-creator-seed:");
+        h.update(storage_dir.as_bytes());
+        let hash = h.finalize();
+        let mut s = [0u8; 32];
+        s.copy_from_slice(&hash);
+        s
+    };
+    let creator_kp = pre::creator_keygen_from_seed(&pre_seed);
     let role = "creator";
 
     // 1. Read file
@@ -3040,6 +3364,24 @@ fn handle_register(
         secs.to_string()
     };
 
+    // PRE: encrypt the AES key under the creator's PRE public key
+    let pre_ct = pre::encrypt(&creator_kp.pk, &key);
+    let ct_bytes = pre::serialize_ciphertext(&pre_ct);
+    let pre_c1_hex = hex::encode(&ct_bytes[..48]);
+    let pre_c2_hex = hex::encode(&ct_bytes[48..]);
+    let pre_pk_hex = hex::encode(pre::serialize_creator_pk(&creator_kp.pk));
+
+    emitter.emit(
+        role,
+        "PRE_CIPHERTEXT_CREATED",
+        serde_json::json!({
+            "pre_c1": &pre_c1_hex,
+            "pre_c2": &pre_c2_hex,
+            "pre_pk_creator": &pre_pk_hex,
+            "message": "AES key encrypted under creator PRE public key (AFGH06)",
+        }),
+    );
+
     let entry = CatalogEntry {
         content_hash: content_hash.clone(),
         file_name: file_name.clone(),
@@ -3050,13 +3392,16 @@ fn handle_register(
         encrypted_hash: encrypted_hash.clone(),
         size_bytes,
         registered_at: registered_at.clone(),
-        transport_price: 0, // creator entries don't have transport price
-        // P2P chunk metadata
+        transport_price: 0,
         chunk_size: meta.chunk_size,
         chunk_count: meta.count,
         plaintext_root: hex::encode(plain_tree.root()),
         encrypted_root: hex::encode(enc_tree.root()),
-        chunks_held: Vec::new(), // empty = creator has all chunks
+        chunks_held: Vec::new(),
+        // PRE fields
+        pre_c1_hex: pre_c1_hex.clone(),
+        pre_c2_hex: pre_c2_hex.clone(),
+        pre_pk_creator_hex: pre_pk_hex.clone(),
     };
 
     {
@@ -3111,6 +3456,7 @@ fn handle_register(
             "creator_pubkey": &info.node_pubkey,
             "creator_address": &info.http_address,
             "creator_ln_address": &info.ln_address,
+            "creator_alias": &info.node_alias,
             "registered_at": &registered_at,
         });
         let url = format!("{}/api/listings", info.url);
@@ -3732,7 +4078,7 @@ fn handle_buy_two_phase(
 }
 
 // ---------------------------------------------------------------------------
-// A5: Chunk planner — rarest-first selection (BitTorrent / eMule style)
+// A5: Chunk planner — rarest-first selection (BitTorrent-style)
 // ---------------------------------------------------------------------------
 
 /// Rarest-first chunk assignment.
@@ -4079,7 +4425,7 @@ fn handle_buy_chunked(
         }
     }
 
-    // Rarest-first chunk assignment (BitTorrent / eMule style)
+    // Rarest-first chunk assignment (BitTorrent-style)
     let (download_order, assignments) = plan_chunk_assignments(chunk_count, &seeder_bitfields);
 
     // Check for unassignable chunks (no seeder has them)
@@ -4707,6 +5053,11 @@ struct Cli {
     #[arg(long)]
     ads_dir: Option<String>,
 
+    /// Human-readable node alias (max 32 bytes). Shown in network explorers
+    /// and the dashboard network visualization.
+    #[arg(long)]
+    alias: Option<String>,
+
     /// Path to dashboard HTML file (unified UI). If set, GET / serves this
     /// file instead of the embedded console HTML.
     #[arg(long)]
@@ -4807,10 +5158,13 @@ fn main() {
         ChainSource::Esplora(url)
     };
 
+    let node_alias_value = cli.alias.clone().unwrap_or_default();
+
     let config = LightningConfig {
         storage_dir: cli.storage_dir,
         listening_port: cli.port,
         chain_source,
+        node_alias: cli.alias.clone(),
         ..LightningConfig::default()
     };
 
@@ -4886,6 +5240,7 @@ fn main() {
             node_pubkey: id.clone(),
             http_address: http_addr,
             ln_address: ln_addr,
+            node_alias: node_alias_value.clone(),
         }
     });
 
@@ -4910,6 +5265,7 @@ fn main() {
                 "seeder_pubkey": &info.node_pubkey,
                 "seeder_address": &info.http_address,
                 "seeder_ln_address": &info.ln_address,
+                "seeder_alias": &info.node_alias,
                 "transport_price": entry.transport_price,
                 "chunk_count": entry.chunk_count,
                 "chunks_held": &entry.chunks_held,
@@ -4959,6 +5315,7 @@ fn main() {
 
         let state = AppState {
             node: node.clone(),
+            node_alias: node_alias_value.clone(),
             emitter: emitter.clone(),
             event_router: event_router.clone(),
             catalog: catalog.clone(),
