@@ -82,8 +82,10 @@ if [ "$PRE_CT" = "FAILED" ]; then
 fi
 
 echo "       PRE ciphertext retrieved successfully."
-echo "       c1: $(echo "$PRE_CT" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['pre_c1_hex'][:32])...")..."
-echo "       c2: $(echo "$PRE_CT" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['pre_c2_hex'][:32])...")..."
+C1_PREVIEW=$(echo "$PRE_CT" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['pre_c1_hex'][:32])")
+C2_PREVIEW=$(echo "$PRE_CT" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['pre_c2_hex'][:32])")
+echo "       c1: ${C1_PREVIEW}..."
+echo "       c2: ${C2_PREVIEW}..."
 echo ""
 
 # Step 4: Test the /api/pre-purchase endpoint (requires buyer pk)
@@ -96,11 +98,10 @@ echo "[4/6] Testing /api/pre-purchase endpoint..."
 echo "       NOTE: Full purchase test requires deployed buyer with PRE support."
 echo "       Testing API availability..."
 
-HTTP_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" \
+HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
     -X POST "$CREATOR/api/pre-purchase/$CONTENT_HASH" \
     -H "Content-Type: application/json" \
-    -d '{"buyer_pk_hex": "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"}' \
-    2>/dev/null || echo "000")
+    -d '{"buyer_pk_hex": "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"}')
 
 if [ "$HTTP_STATUS" = "400" ]; then
     echo "       /api/pre-purchase returned 400 (expected — invalid G2 point)"
