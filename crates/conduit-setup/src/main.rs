@@ -5237,6 +5237,19 @@ fn handle_buy(
 // buy-pre command
 // ---------------------------------------------------------------------------
 
+/// Helper macro: emit BUY_ERROR and return early on failure.
+macro_rules! pre_bail {
+    ($emitter:expr, $msg:expr) => {{
+        $emitter.emit(
+            "buyer",
+            "BUY_ERROR",
+            serde_json::json!({ "message": $msg }),
+        );
+        eprintln!("PRE buy error: {}", $msg);
+        return;
+    }};
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_buy_pre(
     node: &Arc<Node>,
@@ -5251,6 +5264,10 @@ fn handle_buy_pre(
 ) {
     let role = "buyer";
     let buyer_pk_hex = hex::encode(pre::serialize_buyer_pk(&buyer_kp.pk));
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .unwrap();
 
     emitter.emit(
         role,
@@ -5264,31 +5281,54 @@ fn handle_buy_pre(
     println!("=== BUY-PRE ===");
     println!("Creator: {}", creator_url);
     println!("Content: {}", content_hash);
-    println!("Buyer PK (G2): {}...{}", &buyer_pk_hex[..16], &buyer_pk_hex[buyer_pk_hex.len()-16..]);
 
     // 1. Call creator's /api/pre-purchase/{content_hash} with buyer pk
-    let purchase_url = format!("{}/api/pre-purchase/{}", creator_url.trim_end_matches('/'), content_hash);
-    let client = reqwest::blocking::Client::new();
-    let resp = client
+    let purchase_url = format!(
+        "{}/api/pre-purchase/{}",
+        creator_url.trim_end_matches('/'),
+        content_hash
+    );
+    let resp = match client
         .post(&purchase_url)
         .json(&serde_json::json!({ "buyer_pk_hex": buyer_pk_hex }))
         .send()
-        .expect("Failed to call creator /api/pre-purchase");
+    {
+        Ok(r) => r,
+        Err(e) => pre_bail!(emitter, format!("Failed to contact creator: {}", e)),
+    };
 
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().unwrap_or_default();
-        eprintln!("ERROR: Creator returned {} — {}", status, body);
-        return;
+        pre_bail!(emitter, format!("Creator returned {} — {}", status, body));
     }
 
-    let purchase_resp: serde_json::Value = resp.json().expect("Invalid JSON from creator");
-    let bolt11 = purchase_resp["bolt11"].as_str().expect("Missing bolt11 in response");
-    let rk_compressed_hex = purchase_resp["rk_compressed_hex"].as_str().expect("Missing rk_compressed_hex");
-    let pre_c1_hex = purchase_resp["pre_c1_hex"].as_str().expect("Missing pre_c1_hex");
-    let pre_c2_hex = purchase_resp["pre_c2_hex"].as_str().expect("Missing pre_c2_hex");
+    let purchase_resp: serde_json::Value = match resp.json() {
+        Ok(v) => v,
+        Err(e) => pre_bail!(emitter, format!("Invalid JSON from creator: {}", e)),
+    };
+
+    let bolt11 = match purchase_resp["bolt11"].as_str() {
+        Some(s) => s.to_string(),
+        None => pre_bail!(emitter, "Creator response missing bolt11"),
+    };
+    let rk_compressed_hex = match purchase_resp["rk_compressed_hex"].as_str() {
+        Some(s) => s.to_string(),
+        None => pre_bail!(emitter, "Creator response missing rk_compressed_hex"),
+    };
+    let pre_c1_hex = match purchase_resp["pre_c1_hex"].as_str() {
+        Some(s) => s.to_string(),
+        None => pre_bail!(emitter, "Creator response missing pre_c1_hex (content may not be PRE-enabled)"),
+    };
+    let pre_c2_hex = match purchase_resp["pre_c2_hex"].as_str() {
+        Some(s) => s.to_string(),
+        None => pre_bail!(emitter, "Creator response missing pre_c2_hex"),
+    };
     let price_sats = purchase_resp["price_sats"].as_u64().unwrap_or(0);
-    let enc_hash = purchase_resp["encrypted_hash"].as_str().unwrap_or("");
+    let enc_hash = purchase_resp["encrypted_hash"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
 
     emitter.emit(
         role,
@@ -5297,11 +5337,10 @@ fn handle_buy_pre(
             "bolt11_len": bolt11.len(),
             "rk_len": rk_compressed_hex.len(),
             "price_sats": price_sats,
-            "encrypted_hash": enc_hash,
+            "encrypted_hash": &enc_hash,
         }),
     );
     println!("Invoice received ({} sats)", price_sats);
-    println!("rk_compressed: {}...{}", &rk_compressed_hex[..16], &rk_compressed_hex[rk_compressed_hex.len()-16..]);
 
     // 2. Countdown
     for i in (1..=3).rev() {
@@ -5320,9 +5359,12 @@ fn handle_buy_pre(
     emitter.emit(
         role,
         "PAYING_INVOICE",
-        serde_json::json!({ "bolt11": bolt11 }),
+        serde_json::json!({ "bolt11": &bolt11 }),
     );
-    let hash_bytes = invoice::pay_invoice(node, bolt11).expect("Failed to pay invoice");
+    let hash_bytes = match invoice::pay_invoice(node, &bolt11) {
+        Ok(h) => h,
+        Err(e) => pre_bail!(emitter, format!("Failed to pay invoice: {:?}", e)),
+    };
     let target_hash = PaymentHash(hash_bytes);
     emitter.emit(
         role,
@@ -5333,10 +5375,16 @@ fn handle_buy_pre(
         }),
     );
 
-    // 4. Wait for payment confirmation (preimage = SHA-256(rk_compressed))
+    // 4. Wait for payment confirmation
     let rx = router.register(target_hash);
     loop {
-        let event = rx.recv().expect("Event router dropped");
+        let event = match rx.recv() {
+            Ok(e) => e,
+            Err(_) => {
+                router.unregister(&target_hash);
+                pre_bail!(emitter, "Event router dropped");
+            }
+        };
         match event {
             Event::PaymentSuccessful {
                 payment_hash,
@@ -5351,10 +5399,13 @@ fn handle_buy_pre(
                         "payment_hash": hex::encode(payment_hash.0),
                         "preimage": hex::encode(preimage.0),
                         "fee_msat": fee_paid_msat,
-                        "message": "PRE payment confirmed. Preimage = SHA-256(rk). AES key recoverable via PRE.",
+                        "message": "PRE payment confirmed.",
                     }),
                 );
-                println!("Payment confirmed (fee: {} msat)", fee_paid_msat.unwrap_or(0));
+                println!(
+                    "Payment confirmed (fee: {} msat)",
+                    fee_paid_msat.unwrap_or(0)
+                );
                 break;
             }
             Event::PaymentFailed { reason, .. } => {
@@ -5367,55 +5418,70 @@ fn handle_buy_pre(
                     }),
                 );
                 router.unregister(&target_hash);
-                panic!("PRE payment failed: {:?}", reason);
+                return;
             }
             _ => {}
         }
     }
     router.unregister(&target_hash);
 
-    // 5. Recover AES key m via PRE decryption (buyer-side, no seeder needed)
-    //    c1' = e(c1, rk)    ... re-encrypt locally
-    //    m = c2 XOR KDF( c1'^(1/b) )
-    let m = pre::buyer_decrypt_from_hex(
+    // 5. Recover AES key m via PRE decryption
+    let m = match pre::buyer_decrypt_from_hex(
         &buyer_kp.sk,
-        pre_c1_hex,
-        pre_c2_hex,
-        rk_compressed_hex,
-    )
-    .expect("PRE decryption failed — invalid ciphertext or key");
+        &pre_c1_hex,
+        &pre_c2_hex,
+        &rk_compressed_hex,
+    ) {
+        Some(m) => m,
+        None => pre_bail!(emitter, "PRE decryption failed — invalid ciphertext or key"),
+    };
 
     emitter.emit(
         role,
         "PRE_KEY_RECOVERED",
         serde_json::json!({
             "m_hex": hex::encode(m),
-            "message": "AES key m recovered via PRE (buyer never saw m in transit).",
+            "message": "AES key m recovered via PRE.",
         }),
     );
-    println!("AES key recovered via PRE: {}...{}", &hex::encode(m)[..8], &hex::encode(m)[24..]);
+    println!("AES key recovered via PRE");
 
     // 6. Download encrypted chunks from seeder (or creator)
     let chunk_source = seeder_url.unwrap_or(creator_url);
     let catalog_url = format!("{}/api/catalog", chunk_source.trim_end_matches('/'));
-    let catalog_resp: Vec<serde_json::Value> = client
-        .get(&catalog_url)
-        .send()
-        .expect("Failed to fetch catalog")
-        .json()
-        .expect("Invalid catalog JSON");
+    let catalog_json: serde_json::Value = match client.get(&catalog_url).send() {
+        Ok(r) => match r.json() {
+            Ok(v) => v,
+            Err(e) => pre_bail!(emitter, format!("Invalid catalog JSON: {}", e)),
+        },
+        Err(e) => pre_bail!(emitter, format!("Failed to fetch catalog from {}: {}", chunk_source, e)),
+    };
 
-    // Find the entry
-    let entry = catalog_resp
-        .iter()
-        .find(|e| {
-            e["content_hash"].as_str() == Some(content_hash)
-                || e["encrypted_hash"].as_str() == Some(content_hash)
-        })
-        .expect("Content not found in chunk source catalog");
+    // Catalog can be {"items": [...]} or a plain array
+    let catalog_items: Vec<serde_json::Value> = if let Some(arr) = catalog_json.as_array() {
+        arr.clone()
+    } else if let Some(arr) = catalog_json["items"].as_array() {
+        arr.clone()
+    } else {
+        pre_bail!(emitter, "Catalog response has no items array");
+    };
+
+    let entry = match catalog_items.iter().find(|e| {
+        e["content_hash"].as_str() == Some(content_hash)
+            || e["encrypted_hash"].as_str() == Some(content_hash)
+    }) {
+        Some(e) => e.clone(),
+        None => pre_bail!(
+            emitter,
+            format!("Content {} not found in catalog at {}", content_hash, chunk_source)
+        ),
+    };
 
     let num_chunks = entry["total_chunks"].as_u64().unwrap_or(1) as usize;
-    let enc_hash_str = entry["encrypted_hash"].as_str().unwrap_or(content_hash);
+    let enc_hash_str = entry["encrypted_hash"]
+        .as_str()
+        .unwrap_or(content_hash)
+        .to_string();
 
     emitter.emit(
         role,
@@ -5423,7 +5489,7 @@ fn handle_buy_pre(
         serde_json::json!({
             "source": chunk_source,
             "chunks": num_chunks,
-            "encrypted_hash": enc_hash_str,
+            "encrypted_hash": &enc_hash_str,
         }),
     );
     println!("Downloading {} chunks from {}...", num_chunks, chunk_source);
@@ -5436,12 +5502,10 @@ fn handle_buy_pre(
             enc_hash_str,
             i
         );
-        let chunk_bytes = client
-            .get(&chunk_url)
-            .send()
-            .and_then(|r| r.bytes())
-            .expect(&format!("Failed to download chunk {}", i));
-        all_enc_data.extend_from_slice(&chunk_bytes);
+        match client.get(&chunk_url).send().and_then(|r| r.bytes()) {
+            Ok(bytes) => all_enc_data.extend_from_slice(&bytes),
+            Err(e) => pre_bail!(emitter, format!("Failed to download chunk {}: {}", i, e)),
+        }
     }
 
     emitter.emit(
@@ -5452,7 +5516,11 @@ fn handle_buy_pre(
             "chunks": num_chunks,
         }),
     );
-    println!("Downloaded {} bytes ({} chunks)", all_enc_data.len(), num_chunks);
+    println!(
+        "Downloaded {} bytes ({} chunks)",
+        all_enc_data.len(),
+        num_chunks
+    );
 
     // 7. Decrypt per-chunk with recovered AES key m
     let cs = chunk::select_chunk_size(all_enc_data.len());
@@ -5490,11 +5558,12 @@ fn handle_buy_pre(
             content_hash,
             hex::encode(actual_hash)
         );
-        eprintln!("File may still be usable — hash could be encrypted_hash instead of content_hash.");
     }
 
     // 9. Write output
-    std::fs::write(output_path, &decrypted).expect("Failed to write decrypted file");
+    if let Err(e) = std::fs::write(output_path, &decrypted) {
+        pre_bail!(emitter, format!("Failed to write file: {}", e));
+    }
     emitter.emit(
         role,
         "FILE_SAVED",
@@ -5511,8 +5580,6 @@ fn handle_buy_pre(
         output_path,
         decrypted.len()
     );
-    println!("Key delivery: PRE (buyer never saw AES key in transit)");
-    println!("Payment: multihop Lightning (preimage = SHA-256(rk), not m)");
 }
 
 // ---------------------------------------------------------------------------
