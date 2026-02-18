@@ -2793,10 +2793,30 @@ async fn pre_purchase_handler(
     // Compute re-encryption key
     let rk = pre::re_keygen(&creator_kp.sk, &buyer_pk);
 
-    // Create Lightning invoice with PRE preimage
+    // Generate per-purchase nonce so each invoice has a unique payment hash.
+    // rk is deterministic (same creator+buyer = same rk), but we need unique
+    // payment hashes for LDK. Preimage = SHA-256(rk_compressed || nonce).
+    let nonce: [u8; 32] = {
+        use rand::RngCore;
+        let mut n = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut n);
+        n
+    };
+    let htlc_preimage = {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(rk.rk_compressed);
+        h.update(nonce);
+        let result = h.finalize();
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&result);
+        out
+    };
+
+    // Create Lightning invoice with nonce-salted preimage
     let bolt11 = match invoice::create_invoice_for_rk(
         &state.node,
-        &rk.htlc_preimage,
+        &htlc_preimage,
         entry.price_sats,
         &format!("PRE:{}", entry.file_name),
     ) {
@@ -2812,7 +2832,7 @@ async fn pre_purchase_handler(
         }
     };
 
-    let payment_hash = hex::encode(invoice::payment_hash_for_rk(&rk.htlc_preimage));
+    let payment_hash = hex::encode(invoice::payment_hash_for_rk(&htlc_preimage));
     let rk_compressed_hex = hex::encode(rk.rk_compressed);
 
     let emitter = state.emitter.clone();
@@ -2833,9 +2853,8 @@ async fn pre_purchase_handler(
     let node = state.node.clone();
     let emitter2 = state.emitter.clone();
     let router = state.event_router.clone();
-    let preimage = rk.htlc_preimage;
     thread::spawn(move || {
-        handle_pre_sell_from_catalog(&node, &emitter2, &router, &preimage);
+        handle_pre_sell_from_catalog(&node, &emitter2, &router, &htlc_preimage);
     });
 
     Json(serde_json::json!({
