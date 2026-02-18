@@ -5477,7 +5477,10 @@ fn handle_buy_pre(
         ),
     };
 
-    let num_chunks = entry["total_chunks"].as_u64().unwrap_or(1) as usize;
+    let num_chunks = entry["chunk_count"]
+        .as_u64()
+        .or_else(|| entry["total_chunks"].as_u64())
+        .unwrap_or(1) as usize;
     let enc_hash_str = entry["encrypted_hash"]
         .as_str()
         .unwrap_or(content_hash)
@@ -5497,13 +5500,24 @@ fn handle_buy_pre(
     let mut all_enc_data = Vec::new();
     for i in 0..num_chunks {
         let chunk_url = format!(
-            "{}/api/chunk/{}/{}",
+            "{}/api/chunks/{}/{}",
             chunk_source.trim_end_matches('/'),
             enc_hash_str,
             i
         );
-        match client.get(&chunk_url).send().and_then(|r| r.bytes()) {
-            Ok(bytes) => all_enc_data.extend_from_slice(&bytes),
+        match client.get(&chunk_url).send() {
+            Ok(r) => {
+                if !r.status().is_success() {
+                    pre_bail!(
+                        emitter,
+                        format!("Chunk {}: HTTP {} from {}", i, r.status(), chunk_url)
+                    );
+                }
+                match r.bytes() {
+                    Ok(bytes) => all_enc_data.extend_from_slice(&bytes),
+                    Err(e) => pre_bail!(emitter, format!("Chunk {} read error: {}", i, e)),
+                }
+            }
             Err(e) => pre_bail!(emitter, format!("Failed to download chunk {}: {}", i, e)),
         }
     }
