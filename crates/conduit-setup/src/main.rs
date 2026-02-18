@@ -3712,6 +3712,9 @@ fn handle_register(
             "creator_ln_address": &info.ln_address,
             "creator_alias": &info.node_alias,
             "registered_at": &registered_at,
+            "pre_c1_hex": &pre_c1_hex,
+            "pre_c2_hex": &pre_c2_hex,
+            "pre_pk_creator_hex": &pre_pk_hex,
         });
         let url = format!("{}/api/listings", info.url);
         match reqwest::blocking::Client::new()
