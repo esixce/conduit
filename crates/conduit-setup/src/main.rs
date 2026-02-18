@@ -863,6 +863,76 @@ async fn buy_handler(
     Json(serde_json::json!({"status": "started"}))
 }
 
+/// Request body for PRE buy (browser-initiated).
+#[derive(Deserialize)]
+struct BuyPreRequest {
+    /// Creator HTTP base URL (e.g. "http://167.172.152.231:3000")
+    creator_url: String,
+    /// Content hash from catalog
+    content_hash: String,
+    /// Optional seeder URL to download chunks from (defaults to creator)
+    #[serde(default)]
+    seeder_url: Option<String>,
+    /// Output path for decrypted file
+    #[serde(default = "default_pre_output")]
+    output: String,
+}
+
+fn default_pre_output() -> String {
+    format!("/tmp/decrypted-pre-{}", std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis())
+}
+
+/// POST /api/buy-pre — Browser-initiated PRE buy.
+///
+/// Spawns a background thread that:
+///   1. Calls creator /api/pre-purchase with this node's buyer G2 pk
+///   2. Pays the Lightning invoice
+///   3. Recovers AES key m via PRE decryption
+///   4. Downloads & decrypts chunks
+///   5. Emits SSE events throughout
+async fn buy_pre_handler(
+    State(state): State<AppState>,
+    Json(req): Json<BuyPreRequest>,
+) -> Json<serde_json::Value> {
+    let node = state.node.clone();
+    let tx = state.emitter.clone();
+    let router = state.event_router.clone();
+    let storage_dir = state.storage_dir.clone();
+
+    // Derive buyer PRE keypair (same seed as startup)
+    let buyer_kp = {
+        let seed = {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(b"conduit-pre-buyer-seed:");
+            h.update(storage_dir.as_bytes());
+            let hash = h.finalize();
+            let mut s = [0u8; 32];
+            s.copy_from_slice(&hash);
+            s
+        };
+        pre::buyer_keygen_from_seed(&seed)
+    };
+
+    thread::spawn(move || {
+        handle_buy_pre(
+            &node,
+            tx.as_ref(),
+            &router,
+            &storage_dir,
+            &buyer_kp,
+            &req.creator_url,
+            &req.content_hash,
+            req.seeder_url.as_deref(),
+            &req.output,
+        );
+    });
+    Json(serde_json::json!({"status": "started"}))
+}
+
 /// Download a URL to /tmp/ via curl, emitting SSE events. Returns local path on success.
 fn curl_fetch(url: &str, emitter: &ConsoleEmitter) -> Option<String> {
     let local = format!(
@@ -2547,6 +2617,7 @@ fn start_http_server(port: u16, state: AppState) {
                 .route("/api/ad-invoice/{content_hash}", post(ad_invoice_handler))
                 .route("/api/sell", post(sell_handler))
                 .route("/api/buy", post(buy_handler))
+                .route("/api/buy-pre", post(buy_pre_handler))
                 .route("/api/seed", post(seed_handler))
                 .route(
                     "/api/transport-invoice/{encrypted_hash}",
