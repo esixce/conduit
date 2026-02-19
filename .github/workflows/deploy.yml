@@ -256,3 +256,297 @@ jobs:
             systemctl start conduit-node
             sleep 3
             systemctl is-active conduit-node
+
+  deploy-dsgndude:
+    name: Deploy DsgnDude
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: conduit-setup
+      - name: Stop service
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.DSGNDUDE_HOST }}
+          username: root
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script: systemctl stop conduit-node || true
+      - name: Upload binary
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.DSGNDUDE_HOST }}
+          username: root
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          source: conduit-setup
+          target: /root/conduit/target/release/
+          overwrite: true
+      - name: Upload service file
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.DSGNDUDE_HOST }}
+          username: root
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          source: deploy/conduit-dsgndude.service
+          target: /tmp/conduit-deploy/
+          overwrite: true
+      - name: Start service
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.DSGNDUDE_HOST }}
+          username: root
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script: |
+            chmod +x /root/conduit/target/release/conduit-setup
+            cp /tmp/conduit-deploy/deploy/conduit-dsgndude.service /etc/systemd/system/conduit-node.service
+            rm -rf /tmp/conduit-deploy
+            systemctl daemon-reload
+            systemctl start conduit-node
+            sleep 3
+            systemctl is-active conduit-node
+
+  deploy-peer7:
+    name: Deploy Peer7
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: conduit-setup
+      - name: Stop service
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.PEER7_HOST }}
+          username: root
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script: systemctl stop conduit-node || true
+      - name: Upload binary
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.PEER7_HOST }}
+          username: root
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          source: conduit-setup
+          target: /root/conduit/target/release/
+          overwrite: true
+      - name: Upload service file
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.PEER7_HOST }}
+          username: root
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          source: deploy/conduit-peer7.service
+          target: /tmp/conduit-deploy/
+          overwrite: true
+      - name: Start service
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.PEER7_HOST }}
+          username: root
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script: |
+            chmod +x /root/conduit/target/release/conduit-setup
+            cp /tmp/conduit-deploy/deploy/conduit-peer7.service /etc/systemd/system/conduit-node.service
+            rm -rf /tmp/conduit-deploy
+            systemctl daemon-reload
+            systemctl start conduit-node
+            sleep 3
+            systemctl is-active conduit-node
+
+  deploy-peer8:
+    name: Deploy Peer8
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: conduit-setup
+      - name: Stop service
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.PEER8_HOST }}
+          username: root
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script: systemctl stop conduit-node || true
+      - name: Upload binary
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.PEER8_HOST }}
+          username: root
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          source: conduit-setup
+          target: /root/conduit/target/release/
+          overwrite: true
+      - name: Upload service file
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.PEER8_HOST }}
+          username: root
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          source: deploy/conduit-peer8.service
+          target: /tmp/conduit-deploy/
+          overwrite: true
+      - name: Start service
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.PEER8_HOST }}
+          username: root
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script: |
+            chmod +x /root/conduit/target/release/conduit-setup
+            cp /tmp/conduit-deploy/deploy/conduit-peer8.service /etc/systemd/system/conduit-node.service
+            rm -rf /tmp/conduit-deploy
+            systemctl daemon-reload
+            systemctl start conduit-node
+            sleep 3
+            systemctl is-active conduit-node
+
+  deploy-dsgndude:
+    name: Deploy DsgnDude
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: conduit-setup
+      - name: Stop service
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.DSGNDUDE_HOST }}
+          username: root
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script: systemctl stop conduit-node || true
+      - name: Upload binary
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.DSGNDUDE_HOST }}
+          username: root
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          source: conduit-setup
+          target: /root/conduit/target/release/
+          overwrite: true
+      - name: Upload service file
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.DSGNDUDE_HOST }}
+          username: root
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          source: deploy/conduit-dsgndude.service
+          target: /tmp/conduit-deploy/
+          overwrite: true
+      - name: Start service
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.DSGNDUDE_HOST }}
+          username: root
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script: |
+            chmod +x /root/conduit/target/release/conduit-setup
+            cp /tmp/conduit-deploy/deploy/conduit-dsgndude.service /etc/systemd/system/conduit-node.service
+            rm -rf /tmp/conduit-deploy
+            systemctl daemon-reload
+            systemctl start conduit-node
+            sleep 3
+            systemctl is-active conduit-node
+
+  deploy-peer7:
+    name: Deploy Peer7
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: conduit-setup
+      - name: Stop service
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.PEER7_HOST }}
+          username: root
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script: systemctl stop conduit-node || true
+      - name: Upload binary
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.PEER7_HOST }}
+          username: root
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          source: conduit-setup
+          target: /root/conduit/target/release/
+          overwrite: true
+      - name: Upload service file
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.PEER7_HOST }}
+          username: root
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          source: deploy/conduit-peer7.service
+          target: /tmp/conduit-deploy/
+          overwrite: true
+      - name: Start service
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.PEER7_HOST }}
+          username: root
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script: |
+            chmod +x /root/conduit/target/release/conduit-setup
+            cp /tmp/conduit-deploy/deploy/conduit-peer7.service /etc/systemd/system/conduit-node.service
+            rm -rf /tmp/conduit-deploy
+            systemctl daemon-reload
+            systemctl start conduit-node
+            sleep 3
+            systemctl is-active conduit-node
+
+  deploy-peer8:
+    name: Deploy Peer8
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: conduit-setup
+      - name: Stop service
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.PEER8_HOST }}
+          username: root
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script: systemctl stop conduit-node || true
+      - name: Upload binary
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.PEER8_HOST }}
+          username: root
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          source: conduit-setup
+          target: /root/conduit/target/release/
+          overwrite: true
+      - name: Upload service file
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.PEER8_HOST }}
+          username: root
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          source: deploy/conduit-peer8.service
+          target: /tmp/conduit-deploy/
+          overwrite: true
+      - name: Start service
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.PEER8_HOST }}
+          username: root
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script: |
+            chmod +x /root/conduit/target/release/conduit-setup
+            cp /tmp/conduit-deploy/deploy/conduit-peer8.service /etc/systemd/system/conduit-node.service
+            rm -rf /tmp/conduit-deploy
+            systemctl daemon-reload
+            systemctl start conduit-node
+            sleep 3
+            systemctl is-active conduit-node

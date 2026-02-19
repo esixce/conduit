@@ -93,7 +93,9 @@ impl Bitfield {
     pub fn has_chunk(&self, index: u32) -> bool {
         let byte_idx = (index / 8) as usize;
         let bit_idx = 7 - (index % 8);
-        self.bits.get(byte_idx).map_or(false, |b| b & (1 << bit_idx) != 0)
+        self.bits
+            .get(byte_idx)
+            .map_or(false, |b| b & (1 << bit_idx) != 0)
     }
 
     pub fn set_chunk(&mut self, index: u32) {
@@ -115,7 +117,12 @@ impl Bitfield {
                 bits[byte_idx] |= 1 << bit_idx;
             }
         }
-        Self { bits, chunk_count, chunk_size, encrypted_root }
+        Self {
+            bits,
+            chunk_count,
+            chunk_size,
+            encrypted_root,
+        }
     }
 }
 

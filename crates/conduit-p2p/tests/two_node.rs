@@ -142,10 +142,8 @@ async fn full_download_flow() {
 
     // Buyer endpoint (outbound-only)
     let buyer_ep = make_endpoint(vec![]).await;
-    let client = conduit_p2p::client::BuyerClient::new(
-        buyer_ep.clone(),
-        "mock_ln_pubkey".to_string(),
-    );
+    let client =
+        conduit_p2p::client::BuyerClient::new(buyer_ep.clone(), "mock_ln_pubkey".to_string());
 
     let result = client
         .download(seeder_addr, encrypted_hash, &[0, 1, 2], &MockPayment)
@@ -187,10 +185,8 @@ async fn partial_chunk_request() {
 
     let seeder_addr = seeder_ep.addr();
     let buyer_ep = make_endpoint(vec![]).await;
-    let client = conduit_p2p::client::BuyerClient::new(
-        buyer_ep.clone(),
-        "partial_test_ln".to_string(),
-    );
+    let client =
+        conduit_p2p::client::BuyerClient::new(buyer_ep.clone(), "partial_test_ln".to_string());
 
     // Only request chunks 1 and 3
     let result = client

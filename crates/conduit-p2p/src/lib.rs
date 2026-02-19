@@ -5,11 +5,11 @@
 //!
 //! Design: [`docs/02_p2p_distribution.md`], [`docs/13_transport_and_dht.md`]
 
-pub mod wire;
-pub mod node;
-pub mod handler;
 pub mod client;
 pub mod dht;
+pub mod handler;
+pub mod node;
+pub mod wire;
 
 pub use iroh;
 
