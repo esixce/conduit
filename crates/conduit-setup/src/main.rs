@@ -988,6 +988,7 @@ async fn buy_pre_handler(
     let tx = state.emitter.clone();
     let router = state.event_router.clone();
     let storage_dir = state.storage_dir.clone();
+    let p2p_node = state.p2p_node.clone();
 
     // Derive buyer PRE keypair (same seed as startup)
     let buyer_kp = {
@@ -1015,6 +1016,7 @@ async fn buy_pre_handler(
             &req.content_hash,
             req.seeder_url.as_deref(),
             &req.output,
+            p2p_node,
         );
     });
     Json(serde_json::json!({"status": "started"}))
@@ -5790,6 +5792,7 @@ macro_rules! pre_bail {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn handle_buy_pre(
     node: &Arc<Node>,
     emitter: &ConsoleEmitter,
@@ -5800,6 +5803,7 @@ fn handle_buy_pre(
     content_hash: &str,
     seeder_url: Option<&str>,
     output_path: &str,
+    p2p_node: Option<Arc<conduit_p2p::node::P2pNode>>,
 ) {
     let role = "buyer";
     let buyer_pk_hex = hex::encode(pre::serialize_buyer_pk(&buyer_kp.pk));
@@ -5987,80 +5991,199 @@ fn handle_buy_pre(
 
     // 6. Download encrypted chunks from seeder (or creator)
     let chunk_source = seeder_url.unwrap_or(creator_url);
-    let catalog_url = format!("{}/api/catalog", chunk_source.trim_end_matches('/'));
-    let catalog_json: serde_json::Value = match client.get(&catalog_url).send() {
-        Ok(r) => match r.json() {
-            Ok(v) => v,
-            Err(e) => pre_bail!(emitter, format!("Invalid catalog JSON: {}", e)),
-        },
-        Err(e) => pre_bail!(emitter, format!("Failed to fetch catalog from {}: {}", chunk_source, e)),
-    };
 
-    // Catalog can be {"items": [...]} or a plain array
-    let catalog_items: Vec<serde_json::Value> = if let Some(arr) = catalog_json.as_array() {
-        arr.clone()
-    } else if let Some(arr) = catalog_json["items"].as_array() {
-        arr.clone()
-    } else {
-        pre_bail!(emitter, "Catalog response has no items array");
-    };
-
-    let entry = match catalog_items.iter().find(|e| {
-        e["content_hash"].as_str() == Some(content_hash)
-            || e["encrypted_hash"].as_str() == Some(content_hash)
-    }) {
-        Some(e) => e.clone(),
-        None => pre_bail!(
-            emitter,
-            format!("Content {} not found in catalog at {}", content_hash, chunk_source)
-        ),
-    };
-
-    let num_chunks = entry["chunk_count"]
-        .as_u64()
-        .or_else(|| entry["total_chunks"].as_u64())
-        .unwrap_or(1) as usize;
-    let enc_hash_str = entry["encrypted_hash"]
-        .as_str()
-        .unwrap_or(content_hash)
-        .to_string();
-
-    emitter.emit(
-        role,
-        "DOWNLOADING_CHUNKS",
-        serde_json::json!({
-            "source": chunk_source,
-            "chunks": num_chunks,
-            "encrypted_hash": &enc_hash_str,
-        }),
-    );
-    println!("Downloading {} chunks from {}...", num_chunks, chunk_source);
-
-    let mut all_enc_data = Vec::new();
-    for i in 0..num_chunks {
-        let chunk_url = format!(
-            "{}/api/chunks/{}/{}",
-            chunk_source.trim_end_matches('/'),
-            enc_hash_str,
-            i
-        );
-        match client.get(&chunk_url).send() {
-            Ok(r) => {
-                if !r.status().is_success() {
-                    pre_bail!(
-                        emitter,
-                        format!("Chunk {}: HTTP {} from {}", i, r.status(), chunk_url)
+    // Try P2P download first if we have an iroh node and the source supports it
+    let p2p_result = if let Some(ref p2p) = p2p_node {
+        let p2p_info_url = format!("{}/api/p2p-info", chunk_source.trim_end_matches('/'));
+        match client.get(&p2p_info_url).send() {
+            Ok(r) => match r.json::<serde_json::Value>() {
+                Ok(info) if info["enabled"].as_bool() == Some(true) => {
+                    let remote_node_id = info["node_id"].as_str().unwrap_or("").to_string();
+                    emitter.emit(
+                        role,
+                        "P2P_CONNECTING",
+                        serde_json::json!({
+                            "remote_node_id": &remote_node_id,
+                            "message": "Connecting to seeder via P2P (iroh QUIC)...",
+                        }),
                     );
-                }
-                match r.bytes() {
-                    Ok(bytes) => all_enc_data.extend_from_slice(&bytes),
-                    Err(e) => pre_bail!(emitter, format!("Chunk {} read error: {}", i, e)),
-                }
-            }
-            Err(e) => pre_bail!(emitter, format!("Failed to download chunk {}: {}", i, e)),
-        }
-    }
+                    println!("P2P: connecting to seeder {}", &remote_node_id[..16]);
 
+                    // Parse remote node ID into iroh EndpointId
+                    match remote_node_id.parse::<conduit_p2p::iroh::PublicKey>() {
+                        Ok(remote_pk) => {
+                            let ep = p2p.endpoint().clone();
+                            let enc_hash_bytes = hex::decode(&enc_hash)
+                                .ok()
+                                .and_then(|b| if b.len() == 32 {
+                                    let mut arr = [0u8; 32];
+                                    arr.copy_from_slice(&b);
+                                    Some(arr)
+                                } else {
+                                    None
+                                });
+
+                            match enc_hash_bytes {
+                                Some(hash_bytes) => {
+                                    let ln_pk = node.node_id().to_string();
+                                    let buyer_client = conduit_p2p::client::BuyerClient::new(
+                                        ep,
+                                        ln_pk,
+                                    );
+                                    let addr = conduit_p2p::iroh::EndpointAddr::from(remote_pk);
+                                    let rt = tokio::runtime::Runtime::new().unwrap();
+                                    // Fetch catalog to know chunk count
+                                    let catalog_url = format!("{}/api/catalog", chunk_source.trim_end_matches('/'));
+                                    let cat_resp = client.get(&catalog_url).send().ok().and_then(|r| r.json::<serde_json::Value>().ok());
+                                    let num_chunks = cat_resp.as_ref().and_then(|cat| {
+                                        let items = cat.as_array().or_else(|| cat["items"].as_array())?;
+                                        let entry = items.iter().find(|e| {
+                                            e["content_hash"].as_str() == Some(content_hash)
+                                                || e["encrypted_hash"].as_str() == Some(content_hash)
+                                        })?;
+                                        entry["chunk_count"].as_u64().or_else(|| entry["total_chunks"].as_u64())
+                                    }).unwrap_or(1) as u32;
+
+                                    let indices: Vec<u32> = (0..num_chunks).collect();
+                                    struct DirectPayment;
+                                    impl conduit_p2p::client::PaymentHandler for DirectPayment {
+                                        fn pay_invoice(&self, _bolt11: &str) -> anyhow::Result<[u8; 32]> {
+                                            // P2P chunks for PRE don't use transport payment —
+                                            // the content key payment already happened above.
+                                            // Return a dummy preimage to satisfy the protocol.
+                                            Ok([0u8; 32])
+                                        }
+                                    }
+
+                                    match rt.block_on(buyer_client.download(addr, hash_bytes, &indices, &DirectPayment)) {
+                                        Ok(result) => {
+                                            emitter.emit(
+                                                role,
+                                                "P2P_DOWNLOAD_COMPLETE",
+                                                serde_json::json!({
+                                                    "chunks": result.chunks.len(),
+                                                    "total_bytes": result.chunks.iter().map(|(_, d)| d.len()).sum::<usize>(),
+                                                    "message": "Chunks downloaded via P2P!",
+                                                }),
+                                            );
+                                            println!("P2P: downloaded {} chunks", result.chunks.len());
+                                            let mut sorted = result.chunks;
+                                            sorted.sort_by_key(|(idx, _)| *idx);
+                                            let data: Vec<u8> = sorted.into_iter().flat_map(|(_, d)| d).collect();
+                                            Some(data)
+                                        }
+                                        Err(e) => {
+                                            emitter.emit(
+                                                role,
+                                                "P2P_DOWNLOAD_FAILED",
+                                                serde_json::json!({
+                                                    "error": format!("{}", e),
+                                                    "message": "P2P download failed, falling back to HTTP.",
+                                                }),
+                                            );
+                                            println!("P2P: download failed ({}), falling back to HTTP", e);
+                                            None
+                                        }
+                                    }
+                                }
+                                None => None,
+                            }
+                        }
+                        Err(_) => None,
+                    }
+                }
+                _ => None,
+            },
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+
+    let all_enc_data = if let Some(data) = p2p_result {
+        data
+    } else {
+        // HTTP fallback
+        let catalog_url = format!("{}/api/catalog", chunk_source.trim_end_matches('/'));
+        let catalog_json: serde_json::Value = match client.get(&catalog_url).send() {
+            Ok(r) => match r.json() {
+                Ok(v) => v,
+                Err(e) => pre_bail!(emitter, format!("Invalid catalog JSON: {}", e)),
+            },
+            Err(e) => pre_bail!(emitter, format!("Failed to fetch catalog from {}: {}", chunk_source, e)),
+        };
+
+        let catalog_items: Vec<serde_json::Value> = if let Some(arr) = catalog_json.as_array() {
+            arr.clone()
+        } else if let Some(arr) = catalog_json["items"].as_array() {
+            arr.clone()
+        } else {
+            pre_bail!(emitter, "Catalog response has no items array");
+        };
+
+        let entry = match catalog_items.iter().find(|e| {
+            e["content_hash"].as_str() == Some(content_hash)
+                || e["encrypted_hash"].as_str() == Some(content_hash)
+        }) {
+            Some(e) => e.clone(),
+            None => pre_bail!(
+                emitter,
+                format!("Content {} not found in catalog at {}", content_hash, chunk_source)
+            ),
+        };
+
+        let num_chunks = entry["chunk_count"]
+            .as_u64()
+            .or_else(|| entry["total_chunks"].as_u64())
+            .unwrap_or(1) as usize;
+        let enc_hash_str = entry["encrypted_hash"]
+            .as_str()
+            .unwrap_or(content_hash)
+            .to_string();
+
+        emitter.emit(
+            role,
+            "DOWNLOADING_CHUNKS",
+            serde_json::json!({
+                "source": chunk_source,
+                "chunks": num_chunks,
+                "encrypted_hash": &enc_hash_str,
+            }),
+        );
+        println!("HTTP: downloading {} chunks from {}...", num_chunks, chunk_source);
+
+        let mut data = Vec::new();
+        for i in 0..num_chunks {
+            let chunk_url = format!(
+                "{}/api/chunks/{}/{}",
+                chunk_source.trim_end_matches('/'),
+                enc_hash_str,
+                i
+            );
+            match client.get(&chunk_url).send() {
+                Ok(r) => {
+                    if !r.status().is_success() {
+                        pre_bail!(
+                            emitter,
+                            format!("Chunk {}: HTTP {} from {}", i, r.status(), chunk_url)
+                        );
+                    }
+                    match r.bytes() {
+                        Ok(bytes) => data.extend_from_slice(&bytes),
+                        Err(e) => pre_bail!(emitter, format!("Chunk {} read error: {}", i, e)),
+                    }
+                }
+                Err(e) => pre_bail!(emitter, format!("Failed to download chunk {}: {}", i, e)),
+            }
+        }
+        data
+    };
+
+    let num_chunks = {
+        let cs = chunk::select_chunk_size(all_enc_data.len());
+        let (chunks, _) = chunk::split(&all_enc_data, cs);
+        chunks.len()
+    };
     emitter.emit(
         role,
         "CHUNKS_DOWNLOADED",
@@ -6694,6 +6817,7 @@ fn main() {
                 &content_hash,
                 seeder_url.as_deref(),
                 &output,
+                None,
             );
         }
     }
