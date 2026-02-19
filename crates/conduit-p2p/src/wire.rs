@@ -95,7 +95,7 @@ impl Bitfield {
         let bit_idx = 7 - (index % 8);
         self.bits
             .get(byte_idx)
-            .map_or(false, |b| b & (1 << bit_idx) != 0)
+            .is_some_and(|b| b & (1 << bit_idx) != 0)
     }
 
     pub fn set_chunk(&mut self, index: u32) {
@@ -108,7 +108,7 @@ impl Bitfield {
 
     pub fn from_bools(available: &[bool], chunk_size: u32, encrypted_root: [u8; 32]) -> Self {
         let chunk_count = available.len() as u32;
-        let byte_count = (chunk_count as usize + 7) / 8;
+        let byte_count = (chunk_count as usize).div_ceil(8);
         let mut bits = vec![0u8; byte_count];
         for (i, &has) in available.iter().enumerate() {
             if has {

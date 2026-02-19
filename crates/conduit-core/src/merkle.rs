@@ -75,7 +75,7 @@ impl MerkleTree {
         let mut leaves: Vec<[u8; 32]> = chunks.iter().map(|c| leaf_hash(c)).collect();
 
         // If odd number of leaves, duplicate the last one
-        if leaves.len() > 1 && leaves.len() % 2 != 0 {
+        if leaves.len() > 1 && !leaves.len().is_multiple_of(2) {
             leaves.push(*leaves.last().unwrap());
         }
 
@@ -85,7 +85,7 @@ impl MerkleTree {
         // Build parent layers until we reach the root
         while layers.last().unwrap().len() > 1 {
             let prev = layers.last().unwrap();
-            let mut parent = Vec::with_capacity((prev.len() + 1) / 2);
+            let mut parent = Vec::with_capacity(prev.len().div_ceil(2));
             for pair in prev.chunks(2) {
                 if pair.len() == 2 {
                     parent.push(internal_hash(&pair[0], &pair[1]));
@@ -122,7 +122,11 @@ impl MerkleTree {
         // If there was an odd number of original leaves, the leaf layer
         // was padded. Adjust idx within the padded layer.
         for layer in &self.layers[..self.layers.len() - 1] {
-            let sibling_idx = if idx % 2 == 0 { idx + 1 } else { idx - 1 };
+            let sibling_idx = if idx.is_multiple_of(2) {
+                idx + 1
+            } else {
+                idx - 1
+            };
 
             // The sibling might be the same index if the layer has been
             // promoted (single-element layer), but that shouldn't happen

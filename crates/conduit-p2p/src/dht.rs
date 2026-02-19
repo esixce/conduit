@@ -16,6 +16,7 @@ use tracing::{debug, info, warn};
 
 /// Tracks which content hashes this node is seeding and which
 /// remote seeders have been discovered for content the buyer wants.
+#[derive(Default)]
 pub struct SeederRegistry {
     /// Content we are seeding: encrypted_hash -> our endpoint addr.
     local: Arc<Mutex<HashMap<[u8; 32], EndpointAddr>>>,

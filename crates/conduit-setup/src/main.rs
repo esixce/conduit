@@ -672,7 +672,7 @@ fn save_trust_list(storage_dir: &str, list: &[TrustedManufacturer]) {
 
 /// Startup migration: recompute chunk metadata for legacy seeder catalog entries
 /// that have chunk_count == 0 but have an encrypted file on disk.
-fn migrate_legacy_chunks(storage_dir: &str, catalog: &mut Vec<CatalogEntry>) {
+fn migrate_legacy_chunks(storage_dir: &str, catalog: &mut [CatalogEntry]) {
     let mut migrated = 0usize;
     for entry in catalog.iter_mut() {
         // Only migrate seeder entries: content_hash is empty (seeder doesn't know H(F)),
@@ -1039,7 +1039,7 @@ async fn buy_pre_handler(
 fn curl_fetch(url: &str, emitter: &ConsoleEmitter) -> Option<String> {
     let local = format!(
         "/tmp/fetched-{}",
-        url.split('/').last().unwrap_or("download.enc")
+        url.split('/').next_back().unwrap_or("download.enc")
     );
     emitter.emit(
         "buyer",
@@ -1165,7 +1165,12 @@ async fn catalog_handler(State(state): State<AppState>) -> Json<serde_json::Valu
     let items: Vec<serde_json::Value> = cat
         .iter()
         .map(|e| {
-            let enc_filename = e.enc_file_path.split('/').last().unwrap_or("").to_string();
+            let enc_filename = e
+                .enc_file_path
+                .split('/')
+                .next_back()
+                .unwrap_or("")
+                .to_string();
             serde_json::json!({
                 "content_hash": e.content_hash,
                 "file_name": e.file_name,
@@ -1270,7 +1275,7 @@ async fn invoice_handler(
     let enc_filename = entry
         .enc_file_path
         .split('/')
-        .last()
+        .next_back()
         .unwrap_or("")
         .to_string();
 
@@ -1465,7 +1470,7 @@ async fn ad_invoice_handler(
     let enc_filename = entry
         .enc_file_path
         .split('/')
-        .last()
+        .next_back()
         .unwrap_or("")
         .to_string();
 
@@ -1592,7 +1597,11 @@ async fn transport_invoice_handler(
         // --- Legacy mode: wrap entire file as one blob ---
         let wrapped = encrypt::encrypt(&encrypted, &ks, 0);
         let wrapped_path = format!("{}.wrapped", entry.enc_file_path);
-        let wrapped_filename = wrapped_path.split('/').last().unwrap_or("").to_string();
+        let wrapped_filename = wrapped_path
+            .split('/')
+            .next_back()
+            .unwrap_or("")
+            .to_string();
         if let Err(e) = std::fs::write(&wrapped_path, &wrapped) {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1747,7 +1756,7 @@ async fn transport_invoice_handler(
             "encrypted_hash": encrypted_hash,
             "transport_price": entry.transport_price,
             "chunks": wrapped_files,
-            "wrap_dir": wrap_dir.split('/').last().unwrap_or(""),
+            "wrap_dir": wrap_dir.split('/').next_back().unwrap_or(""),
             "mode": "chunked",
         }))
         .into_response()
@@ -3815,7 +3824,7 @@ fn handle_sell(
         .expect("Failed to create invoice");
     let payment_hash = verify::sha256_hash(&key);
     let enc_path = format!("{}.enc", file_path);
-    let enc_filename = enc_path.split('/').last().unwrap_or("").to_string();
+    let enc_filename = enc_path.split('/').next_back().unwrap_or("").to_string();
     let enc_hash = verify::sha256_hash(&ciphertext);
     emitter.emit(
         role,
@@ -3827,7 +3836,7 @@ fn handle_sell(
             "amount_sats": price,
             "bolt11": &bolt11,
             "enc_filename": &enc_filename,
-            "file_name": file_path.split('/').last().unwrap_or(file_path),
+            "file_name": file_path.split('/').next_back().unwrap_or(file_path),
         }),
     );
 
@@ -3954,6 +3963,7 @@ fn parse_chunks_arg(arg: &Option<String>, total_chunks: usize) -> Vec<usize> {
 // seed command (seeder: wrap with transport key K_S)
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn handle_seed(
     emitter: &ConsoleEmitter,
     storage_dir: &str,
@@ -4018,7 +4028,10 @@ fn handle_seed(
     }
 
     // 4. Derive file_name from enc_file_path (strip .enc suffix)
-    let enc_filename = enc_file_path.split('/').last().unwrap_or("unknown.enc");
+    let enc_filename = enc_file_path
+        .split('/')
+        .next_back()
+        .unwrap_or("unknown.enc");
     let file_name = enc_filename
         .strip_suffix(".enc")
         .unwrap_or(enc_filename)
@@ -4151,7 +4164,11 @@ fn handle_register(
 
     // 1. Read file
     let plaintext = std::fs::read(file_path).expect("Failed to read file");
-    let file_name = file_path.split('/').last().unwrap_or(file_path).to_string();
+    let file_name = file_path
+        .split('/')
+        .next_back()
+        .unwrap_or(file_path)
+        .to_string();
     let size_bytes = plaintext.len() as u64;
 
     // 2. Compute content hash H(F)
@@ -4478,37 +4495,41 @@ fn handle_ad_sell_hold_and_claim(
     loop {
         // Check for Invoice 1 (buyer, K)
         if buyer_htlc.is_none() {
-            if let Ok(event) = rx_k.try_recv() {
-                if let Event::PaymentClaimable {
-                    claimable_amount_msat,
-                    ..
-                } = event
-                {
-                    emitter.emit( role, "AD_HTLC_BUYER_ARRIVED", serde_json::json!({
+            if let Ok(Event::PaymentClaimable {
+                claimable_amount_msat,
+                ..
+            }) = rx_k.try_recv()
+            {
+                emitter.emit(
+                    role,
+                    "AD_HTLC_BUYER_ARRIVED",
+                    serde_json::json!({
                         "payment_hash": hex::encode(hash_k.0),
                         "amount_msat": claimable_amount_msat,
                         "message": "Buyer's HTLC arrived — HOLDING until advertiser's HTLC also arrives",
-                    }));
-                    buyer_htlc = Some(claimable_amount_msat);
-                }
+                    }),
+                );
+                buyer_htlc = Some(claimable_amount_msat);
             }
         }
 
         // Check for Invoice 2 (advertiser, K_ad)
         if ad_htlc.is_none() {
-            if let Ok(event) = rx_k_ad.try_recv() {
-                if let Event::PaymentClaimable {
-                    claimable_amount_msat,
-                    ..
-                } = event
-                {
-                    emitter.emit( role, "AD_HTLC_ADVERTISER_ARRIVED", serde_json::json!({
+            if let Ok(Event::PaymentClaimable {
+                claimable_amount_msat,
+                ..
+            }) = rx_k_ad.try_recv()
+            {
+                emitter.emit(
+                    role,
+                    "AD_HTLC_ADVERTISER_ARRIVED",
+                    serde_json::json!({
                         "payment_hash": hex::encode(hash_k_ad.0),
                         "amount_msat": claimable_amount_msat,
                         "message": "Advertiser's HTLC arrived — HOLDING until buyer's HTLC also arrives",
-                    }));
-                    ad_htlc = Some(claimable_amount_msat);
-                }
+                    }),
+                );
+                ad_htlc = Some(claimable_amount_msat);
             }
         }
 
@@ -5272,7 +5293,7 @@ fn handle_buy_chunked(
 
     // Collect bitfields: seeder_index -> Vec<bool>
     let mut seeder_bitfields: Vec<Vec<bool>> = Vec::new();
-    for (_si, url) in req.seeder_urls.iter().enumerate() {
+    for url in req.seeder_urls.iter() {
         let bf_url = format!("{}/api/chunks/{}/bitfield", url, &enc_hash_hex);
         match client
             .get(&bf_url)
@@ -5899,7 +5920,6 @@ macro_rules! pre_bail {
     }};
 }
 
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 fn handle_buy_pre(
     node: &Arc<Node>,
