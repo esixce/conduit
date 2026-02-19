@@ -17,6 +17,7 @@ ExecStart=/root/conduit/target/release/conduit-setup \
   --registry-url http://157.230.238.79:3003 \
   --dashboard /root/conduit/dashboard.html \
   --alias Creator \
+  --p2p \
   serve
 Restart=on-failure
 RestartSec=5
