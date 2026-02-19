@@ -339,6 +339,8 @@ struct AppState {
     ads_dir: Option<String>,
     // Dashboard
     dashboard_path: Option<String>,
+    // P2P (iroh)
+    p2p_node: Option<Arc<conduit_p2p::node::P2pNode>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2684,6 +2686,194 @@ async fn adv_info_handler(State(state): State<AppState>) -> impl IntoResponse {
 // End of advertiser role
 // ===========================================================================
 
+// ===========================================================================
+// P2P bridge: implements conduit_p2p::handler::ChunkStore for AppState
+// ===========================================================================
+
+/// Wraps AppState to implement the ChunkStore trait for the P2P layer.
+#[derive(Clone)]
+struct ConduitChunkStore {
+    catalog: Arc<std::sync::Mutex<Vec<CatalogEntry>>>,
+    node: Arc<Node>,
+    emitter: Arc<ConsoleEmitter>,
+    /// Active transport keys: encrypted_hash -> K_S bytes.
+    /// When a buyer pays the invoice, the preimage (= K_S) is revealed.
+    pending_keys: Arc<std::sync::Mutex<std::collections::HashMap<[u8; 32], [u8; 32]>>>,
+}
+
+impl std::fmt::Debug for ConduitChunkStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConduitChunkStore").finish_non_exhaustive()
+    }
+}
+
+impl ConduitChunkStore {
+    fn new(state: &AppState) -> Self {
+        Self {
+            catalog: state.catalog.clone(),
+            node: state.node.clone(),
+            emitter: state.emitter.clone(),
+            pending_keys: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        }
+    }
+
+    fn find_entry(&self, encrypted_hash: &[u8; 32]) -> Option<CatalogEntry> {
+        let hash_hex = hex::encode(encrypted_hash);
+        let cat = self.catalog.lock().unwrap();
+        cat.iter().find(|e| e.encrypted_hash == hash_hex).cloned()
+    }
+
+    fn load_chunks(&self, entry: &CatalogEntry) -> Option<Vec<Vec<u8>>> {
+        let encrypted = std::fs::read(&entry.enc_file_path).ok()?;
+        let cs = if entry.chunk_size > 0 {
+            entry.chunk_size
+        } else {
+            chunk::select_chunk_size(encrypted.len())
+        };
+        let (enc_chunks, _) = chunk::split(&encrypted, cs);
+        Some(enc_chunks)
+    }
+}
+
+impl conduit_p2p::handler::ChunkStore for ConduitChunkStore {
+    fn get_chunk(&self, encrypted_hash: &[u8; 32], index: u32) -> Option<Vec<u8>> {
+        let entry = self.find_entry(encrypted_hash)?;
+        if !entry.chunks_held.is_empty() && !entry.chunks_held.contains(&(index as usize)) {
+            return None;
+        }
+        let chunks = self.load_chunks(&entry)?;
+        chunks.get(index as usize).cloned()
+    }
+
+    fn get_proof(
+        &self,
+        encrypted_hash: &[u8; 32],
+        index: u32,
+    ) -> Option<Vec<conduit_p2p::wire::ProofNode>> {
+        let entry = self.find_entry(encrypted_hash)?;
+        let chunks = self.load_chunks(&entry)?;
+        if index as usize >= chunks.len() {
+            return None;
+        }
+        let tree = MerkleTree::from_chunks(&chunks);
+        let proof = tree.proof(index as usize);
+        Some(
+            proof
+                .siblings
+                .iter()
+                .map(|(hash, is_left)| conduit_p2p::wire::ProofNode {
+                    hash: *hash,
+                    is_left: *is_left,
+                })
+                .collect(),
+        )
+    }
+
+    fn get_bitfield(
+        &self,
+        encrypted_hash: &[u8; 32],
+    ) -> Option<conduit_p2p::wire::Bitfield> {
+        let entry = self.find_entry(encrypted_hash)?;
+        let chunks = self.load_chunks(&entry)?;
+        let total = chunks.len() as u32;
+        let available: Vec<bool> = if entry.chunks_held.is_empty() {
+            vec![true; total as usize]
+        } else {
+            (0..total)
+                .map(|i| entry.chunks_held.contains(&(i as usize)))
+                .collect()
+        };
+        let cs = if entry.chunk_size > 0 {
+            entry.chunk_size as u32
+        } else {
+            chunk::select_chunk_size(0) as u32
+        };
+        let root = hex::decode(&entry.encrypted_root)
+            .ok()
+            .and_then(|b| {
+                let mut arr = [0u8; 32];
+                if b.len() == 32 {
+                    arr.copy_from_slice(&b);
+                    Some(arr)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or([0u8; 32]);
+        Some(conduit_p2p::wire::Bitfield::from_bools(&available, cs, root))
+    }
+
+    fn create_invoice(
+        &self,
+        encrypted_hash: &[u8; 32],
+        chunk_indices: &[u32],
+        _buyer_ln_pubkey: &str,
+    ) -> anyhow::Result<(String, u64)> {
+        let entry = self
+            .find_entry(encrypted_hash)
+            .ok_or_else(|| anyhow::anyhow!("content not found"))?;
+        let price_per_chunk = if entry.transport_price > 0 {
+            entry.transport_price
+        } else {
+            1
+        };
+        let total_sats = price_per_chunk * chunk_indices.len() as u64;
+        let ks = encrypt::generate_key();
+        let bolt11 = invoice::create_invoice_for_key(&self.node, &ks, total_sats, "p2p-transport")
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        self.pending_keys
+            .lock()
+            .unwrap()
+            .insert(*encrypted_hash, ks);
+        self.emitter.emit(
+            "seeder",
+            "P2P_INVOICE_CREATED",
+            serde_json::json!({
+                "encrypted_hash": hex::encode(encrypted_hash),
+                "chunks": chunk_indices,
+                "amount_sats": total_sats,
+            }),
+        );
+        Ok((bolt11, total_sats * 1000))
+    }
+
+    fn verify_payment(&self, encrypted_hash: &[u8; 32], preimage: &[u8; 32]) -> bool {
+        let expected = self.pending_keys.lock().unwrap().get(encrypted_hash).copied();
+        match expected {
+            Some(ks) if &ks == preimage => {
+                self.emitter.emit(
+                    "seeder",
+                    "P2P_PAYMENT_VERIFIED",
+                    serde_json::json!({
+                        "encrypted_hash": hex::encode(encrypted_hash),
+                    }),
+                );
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// GET /api/p2p-info -- returns the iroh node ID and address for P2P connections.
+async fn p2p_info_handler(State(state): State<AppState>) -> impl IntoResponse {
+    match &state.p2p_node {
+        Some(p2p) => {
+            let addr = p2p.endpoint_addr();
+            Json(serde_json::json!({
+                "enabled": true,
+                "node_id": p2p.node_id().to_string(),
+                "endpoint_addr": format!("{:?}", addr),
+            }))
+            .into_response()
+        }
+        None => Json(serde_json::json!({
+            "enabled": false,
+        }))
+        .into_response(),
+    }
+}
+
 fn start_http_server(port: u16, state: AppState) {
     thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
@@ -2778,6 +2968,8 @@ fn start_http_server(port: u16, state: AppState) {
                     "/api/device-attest/respond",
                     post(device_attest_respond_handler),
                 )
+                // P2P info
+                .route("/api/p2p-info", get(p2p_info_handler))
                 .layer(CorsLayer::permissive())
                 .with_state(state);
             let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port))
@@ -6008,6 +6200,11 @@ struct Cli {
     #[arg(long)]
     dashboard: Option<String>,
 
+    /// Enable P2P chunk transport (iroh QUIC). When set, the node also
+    /// listens for direct peer connections in addition to HTTP.
+    #[arg(long)]
+    p2p: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -6289,7 +6486,7 @@ fn main() {
         };
         let pre_buyer_pk_hex = hex::encode(pre::serialize_buyer_pk(&buyer_pre_kp.pk));
 
-        let state = AppState {
+        let mut state = AppState {
             node: node.clone(),
             node_alias: node_alias_value.clone(),
             emitter: emitter.clone(),
@@ -6305,7 +6502,48 @@ fn main() {
             advertiser_pubkey_hex: adv_pubkey_hex,
             ads_dir: adv_ads_dir,
             dashboard_path: cli.dashboard.clone(),
+            p2p_node: None,
         };
+
+        // Spawn P2P node if --p2p flag is set
+        if cli.p2p {
+            let p2p_state_for_store = state.clone();
+            let chunk_store = Arc::new(ConduitChunkStore::new(&p2p_state_for_store));
+            let handler = Arc::new(conduit_p2p::handler::ChunkProtocol::new(chunk_store));
+
+            let p2p_sk_seed = {
+                use sha2::Digest;
+                let mut h = sha2::Sha256::new();
+                h.update(b"conduit-p2p-identity:");
+                h.update(config.storage_dir.as_bytes());
+                let hash = h.finalize();
+                let mut s = [0u8; 32];
+                s.copy_from_slice(&hash);
+                s
+            };
+            let p2p_sk = conduit_p2p::iroh::SecretKey::from_bytes(&p2p_sk_seed);
+
+            let p2p_config = conduit_p2p::node::P2pConfig {
+                secret_key: Some(p2p_sk),
+                enable_dht: true,
+            };
+
+            let rt = tokio::runtime::Runtime::new().expect("P2P tokio runtime");
+            let p2p_node = rt.block_on(async {
+                conduit_p2p::node::P2pNode::spawn(p2p_config, handler)
+                    .await
+                    .expect("Failed to start P2P node")
+            });
+            let node_id = p2p_node.node_id();
+            println!("P2P:     iroh node {} (QUIC, DHT-enabled)", node_id);
+            state.p2p_node = Some(Arc::new(p2p_node));
+
+            // Keep the P2P runtime alive in a background thread
+            thread::spawn(move || {
+                rt.block_on(std::future::pending::<()>());
+            });
+        }
+
         start_http_server(http_port, state);
         // Give the server a moment to bind
         thread::sleep(Duration::from_millis(500));
