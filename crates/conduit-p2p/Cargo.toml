@@ -1,0 +1,33 @@
+[package]
+name = "conduit-p2p"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Conduit P2P networking layer: chunk transfer and seeder discovery over iroh"
+
+[dependencies]
+conduit-core = { path = "../conduit-core" }
+
+# P2P networking (iroh QUIC transport + DHT)
+iroh = { version = "0.96", features = ["address-lookup-pkarr-dht"] }
+
+# Wire protocol serialization
+postcard = { version = "1", features = ["alloc"] }
+serde = { version = "1", features = ["derive"] }
+
+# Async runtime
+tokio = { version = "1", features = ["rt", "sync", "macros"] }
+futures-lite = "2"
+
+# Utilities
+anyhow = "1"
+tracing = "0.1"
+sha2 = "0.10"
+hex = "0.4"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tracing-subscriber = "0.3"
+iroh = { version = "0.96", features = ["address-lookup-pkarr-dht", "test-utils"] }
+rand = "0.9"
+postcard = { version = "1", features = ["alloc"] }

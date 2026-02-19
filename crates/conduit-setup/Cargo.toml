@@ -27,3 +27,5 @@ base64 = "0.22"
 sha2 = "0.10"
 rusqlite = "0.31"
 p256 = { version = "0.13", features = ["ecdsa"] }
+conduit-p2p = { path = "../conduit-p2p" }
+anyhow = "1"

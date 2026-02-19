@@ -4,5 +4,6 @@ members = [
     "crates/conduit-creator",
     "crates/conduit-buyer",
     "crates/conduit-setup",
+    "crates/conduit-p2p",
 ]
 resolver = "2"
