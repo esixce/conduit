@@ -30,7 +30,10 @@ pub struct BuyerClient {
 
 impl BuyerClient {
     pub fn new(endpoint: Endpoint, ln_pubkey: String) -> Self {
-        Self { endpoint, ln_pubkey }
+        Self {
+            endpoint,
+            ln_pubkey,
+        }
     }
 
     /// Connect to a seeder and download the specified chunks.
@@ -47,12 +50,16 @@ impl BuyerClient {
         desired_indices: &[u32],
         payment: &dyn PaymentHandler,
     ) -> Result<DownloadResult> {
-        let conn = self.endpoint.connect(seeder_addr, crate::CONDUIT_ALPN).await
+        let conn = self
+            .endpoint
+            .connect(seeder_addr, crate::CONDUIT_ALPN)
+            .await
             .context("connecting to seeder")?;
 
         info!(hash = hex::encode(encrypted_hash), "connected to seeder");
 
-        self.run_session(conn, encrypted_hash, desired_indices, payment).await
+        self.run_session(conn, encrypted_hash, desired_indices, payment)
+            .await
     }
 
     async fn run_session(
@@ -64,15 +71,19 @@ impl BuyerClient {
     ) -> Result<DownloadResult> {
         let (mut send, mut recv) = conn.open_bi().await?;
 
-        write_msg(&mut send, &Message::Handshake(Handshake::new(
-            encrypted_hash,
-            self.ln_pubkey.clone(),
-        ))).await?;
+        write_msg(
+            &mut send,
+            &Message::Handshake(Handshake::new(encrypted_hash, self.ln_pubkey.clone())),
+        )
+        .await?;
 
         let bitfield: Bitfield = match read_msg(&mut recv).await? {
             Message::Bitfield(bf) => bf,
             Message::Reject(r) => anyhow::bail!("seeder rejected: {:?}", r.reason),
-            other => anyhow::bail!("expected Bitfield, got {:?}", std::mem::discriminant(&other)),
+            other => anyhow::bail!(
+                "expected Bitfield, got {:?}",
+                std::mem::discriminant(&other)
+            ),
         };
 
         debug!(
@@ -81,7 +92,8 @@ impl BuyerClient {
             "received bitfield"
         );
 
-        let available: Vec<u32> = desired_indices.iter()
+        let available: Vec<u32> = desired_indices
+            .iter()
             .filter(|&&i| bitfield.has_chunk(i))
             .copied()
             .collect();
@@ -90,7 +102,8 @@ impl BuyerClient {
             anyhow::bail!("seeder has none of the requested chunks");
         }
 
-        let unavailable: Vec<u32> = desired_indices.iter()
+        let unavailable: Vec<u32> = desired_indices
+            .iter()
             .filter(|&&i| !bitfield.has_chunk(i))
             .copied()
             .collect();
@@ -101,9 +114,13 @@ impl BuyerClient {
             );
         }
 
-        write_msg(&mut send, &Message::Request(ChunkRequest {
-            indices: available.clone(),
-        })).await?;
+        write_msg(
+            &mut send,
+            &Message::Request(ChunkRequest {
+                indices: available.clone(),
+            }),
+        )
+        .await?;
 
         let invoice = match read_msg(&mut recv).await? {
             Message::Invoice(inv) => inv,
@@ -117,12 +134,11 @@ impl BuyerClient {
             "received invoice, paying"
         );
 
-        let preimage = payment.pay_invoice(&invoice.bolt11)
+        let preimage = payment
+            .pay_invoice(&invoice.bolt11)
             .context("paying invoice")?;
 
-        write_msg(&mut send, &Message::PaymentProof(PaymentProof {
-            preimage,
-        })).await?;
+        write_msg(&mut send, &Message::PaymentProof(PaymentProof { preimage })).await?;
 
         let mut chunks = Vec::with_capacity(available.len());
         let mut received = 0u32;
@@ -130,7 +146,11 @@ impl BuyerClient {
         while received < invoice.chunk_count {
             match read_msg(&mut recv).await? {
                 Message::Chunk(chunk) => {
-                    debug!(index = chunk.chunk_index, size = chunk.data.len(), "received chunk");
+                    debug!(
+                        index = chunk.chunk_index,
+                        size = chunk.data.len(),
+                        "received chunk"
+                    );
                     chunks.push((chunk.chunk_index, chunk.data));
                     received += 1;
                 }
@@ -138,7 +158,10 @@ impl BuyerClient {
                     anyhow::bail!("seeder rejected mid-transfer: {:?}", r.reason);
                 }
                 other => {
-                    warn!("unexpected message during transfer: {:?}", std::mem::discriminant(&other));
+                    warn!(
+                        "unexpected message during transfer: {:?}",
+                        std::mem::discriminant(&other)
+                    );
                 }
             }
         }
@@ -171,7 +194,10 @@ pub struct MultiSourceDownloader {
 
 impl MultiSourceDownloader {
     pub fn new(endpoint: Endpoint, ln_pubkey: String) -> Self {
-        Self { endpoint, ln_pubkey }
+        Self {
+            endpoint,
+            ln_pubkey,
+        }
     }
 
     /// Probe multiple seeders for their bitfields without downloading.
@@ -192,18 +218,15 @@ impl MultiSourceDownloader {
         results
     }
 
-    async fn probe_one(
-        &self,
-        addr: EndpointAddr,
-        encrypted_hash: [u8; 32],
-    ) -> Result<Bitfield> {
+    async fn probe_one(&self, addr: EndpointAddr, encrypted_hash: [u8; 32]) -> Result<Bitfield> {
         let conn = self.endpoint.connect(addr, crate::CONDUIT_ALPN).await?;
         let (mut send, mut recv) = conn.open_bi().await?;
 
-        write_msg(&mut send, &Message::Handshake(Handshake::new(
-            encrypted_hash,
-            self.ln_pubkey.clone(),
-        ))).await?;
+        write_msg(
+            &mut send,
+            &Message::Handshake(Handshake::new(encrypted_hash, self.ln_pubkey.clone())),
+        )
+        .await?;
 
         let bf = match read_msg(&mut recv).await? {
             Message::Bitfield(bf) => bf,

@@ -56,11 +56,7 @@ impl SeederRegistry {
     }
 
     /// Add a discovered remote seeder.
-    pub fn add_remote_seeder(
-        &self,
-        encrypted_hash: [u8; 32],
-        info: SeederInfo,
-    ) {
+    pub fn add_remote_seeder(&self, encrypted_hash: [u8; 32], info: SeederInfo) {
         debug!(
             hash = hex::encode(encrypted_hash),
             node_id = %info.node_id,
@@ -80,7 +76,9 @@ impl SeederRegistry {
 
     /// Get known seeders for a content hash.
     pub fn get_seeders(&self, encrypted_hash: &[u8; 32]) -> Vec<SeederInfo> {
-        self.remote.lock().unwrap()
+        self.remote
+            .lock()
+            .unwrap()
             .get(encrypted_hash)
             .cloned()
             .unwrap_or_default()

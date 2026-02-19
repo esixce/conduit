@@ -80,15 +80,19 @@ async fn test_full_download_flow() {
     let handler = Arc::new(ChunkProtocol::new(store));
 
     let seeder = P2pNode::spawn(
-        P2pConfig { secret_key: None, enable_dht: false },
+        P2pConfig {
+            secret_key: None,
+            enable_dht: false,
+        },
         handler,
     )
     .await
     .expect("seeder node failed to start");
 
-    let buyer = P2pNode::spawn_buyer(
-        P2pConfig { secret_key: None, enable_dht: false },
-    )
+    let buyer = P2pNode::spawn_buyer(P2pConfig {
+        secret_key: None,
+        enable_dht: false,
+    })
     .await
     .expect("buyer node failed to start");
 
@@ -100,12 +104,7 @@ async fn test_full_download_flow() {
     );
 
     let result = client
-        .download(
-            seeder_addr,
-            TEST_ENCRYPTED_HASH,
-            &[0, 1, 2],
-            &MockPayment,
-        )
+        .download(seeder_addr, TEST_ENCRYPTED_HASH, &[0, 1, 2], &MockPayment)
         .await
         .expect("download failed");
 

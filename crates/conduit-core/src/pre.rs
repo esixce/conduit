@@ -177,11 +177,7 @@ pub fn encrypt(pk_creator: &G1Projective, m: &[u8; 32]) -> Ciphertext {
 }
 
 /// Encrypt with a specific nonce (for deterministic testing only).
-pub fn encrypt_with_nonce(
-    pk_creator: &G1Projective,
-    m: &[u8; 32],
-    k: &Scalar,
-) -> Ciphertext {
+pub fn encrypt_with_nonce(pk_creator: &G1Projective, m: &[u8; 32], k: &Scalar) -> Ciphertext {
     // c1 = k * pk_creator = k * (a * G1) = (a*k) * G1
     let c1 = pk_creator * k;
 
@@ -260,7 +256,9 @@ pub fn re_encrypt_from_bytes(rk_compressed: &[u8; 96], ct: &Ciphertext) -> Optio
 /// m = c2 XOR mask
 /// ```
 pub fn decrypt(sk_buyer: &Scalar, re_ct: &ReEncrypted) -> [u8; 32] {
-    let b_inv = sk_buyer.invert().expect("buyer secret key must be non-zero");
+    let b_inv = sk_buyer
+        .invert()
+        .expect("buyer secret key must be non-zero");
     let z_k = gt_pow(&re_ct.c1_prime, &b_inv);
     let mask = kdf_gt(&z_k);
 

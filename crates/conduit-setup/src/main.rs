@@ -359,9 +359,14 @@ async fn index_handler(State(state): State<AppState>) -> impl IntoResponse {
     Html(CONSOLE_HTML.to_string()).into_response()
 }
 
-fn resolve_dashboard_sibling(dashboard_path: &Option<String>, filename: &str) -> Option<std::path::PathBuf> {
+fn resolve_dashboard_sibling(
+    dashboard_path: &Option<String>,
+    filename: &str,
+) -> Option<std::path::PathBuf> {
     dashboard_path.as_ref().and_then(|p| {
-        std::path::Path::new(p).parent().map(|dir| dir.join(filename))
+        std::path::Path::new(p)
+            .parent()
+            .map(|dir| dir.join(filename))
     })
 }
 
@@ -376,7 +381,9 @@ async fn pwa_static_handler(
     State(state): State<AppState>,
     axum::extract::Path(filename): axum::extract::Path<String>,
 ) -> impl IntoResponse {
-    let entry = PWA_FILES.iter().find(|(name, _)| *name == filename.as_str());
+    let entry = PWA_FILES
+        .iter()
+        .find(|(name, _)| *name == filename.as_str());
     let Some((_, content_type)) = entry else {
         return axum::http::StatusCode::NOT_FOUND.into_response();
     };
@@ -386,7 +393,10 @@ async fn pwa_static_handler(
     match std::fs::read(&path) {
         Ok(data) => {
             let mut headers = axum::http::HeaderMap::new();
-            headers.insert(axum::http::header::CONTENT_TYPE, content_type.parse().unwrap());
+            headers.insert(
+                axum::http::header::CONTENT_TYPE,
+                content_type.parse().unwrap(),
+            );
             if filename == "sw.js" {
                 headers.insert(
                     axum::http::header::HeaderName::from_static("service-worker-allowed"),
@@ -966,10 +976,13 @@ struct BuyPreRequest {
 }
 
 fn default_pre_output() -> String {
-    format!("/tmp/decrypted-pre-{}", std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis())
+    format!(
+        "/tmp/decrypted-pre-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    )
 }
 
 /// POST /api/buy-pre — Browser-initiated PRE buy.
@@ -2771,10 +2784,7 @@ impl conduit_p2p::handler::ChunkStore for ConduitChunkStore {
         )
     }
 
-    fn get_bitfield(
-        &self,
-        encrypted_hash: &[u8; 32],
-    ) -> Option<conduit_p2p::wire::Bitfield> {
+    fn get_bitfield(&self, encrypted_hash: &[u8; 32]) -> Option<conduit_p2p::wire::Bitfield> {
         let entry = self.find_entry(encrypted_hash)?;
         let chunks = self.load_chunks(&entry)?;
         let total = chunks.len() as u32;
@@ -2802,7 +2812,9 @@ impl conduit_p2p::handler::ChunkStore for ConduitChunkStore {
                 }
             })
             .unwrap_or([0u8; 32]);
-        Some(conduit_p2p::wire::Bitfield::from_bools(&available, cs, root))
+        Some(conduit_p2p::wire::Bitfield::from_bools(
+            &available, cs, root,
+        ))
     }
 
     fn create_invoice(
@@ -2840,7 +2852,12 @@ impl conduit_p2p::handler::ChunkStore for ConduitChunkStore {
     }
 
     fn verify_payment(&self, encrypted_hash: &[u8; 32], preimage: &[u8; 32]) -> bool {
-        let expected = self.pending_keys.lock().unwrap().get(encrypted_hash).copied();
+        let expected = self
+            .pending_keys
+            .lock()
+            .unwrap()
+            .get(encrypted_hash)
+            .copied();
         match expected {
             Some(ks) if &ks == preimage => {
                 self.emitter.emit(
@@ -3009,7 +3026,8 @@ async fn trust_add_handler(
         return (
             StatusCode::CONFLICT,
             Json(serde_json::json!({"error": "Manufacturer already trusted"})),
-        ).into_response();
+        )
+            .into_response();
     }
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3022,7 +3040,11 @@ async fn trust_add_handler(
         added_at: ts,
     });
     save_trust_list(&state.storage_dir, &list);
-    println!("Trusted manufacturer added: {} ({})", req.name, &req.pk_hex[..16.min(req.pk_hex.len())]);
+    println!(
+        "Trusted manufacturer added: {} ({})",
+        req.name,
+        &req.pk_hex[..16.min(req.pk_hex.len())]
+    );
     (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
 }
 
@@ -3038,10 +3060,14 @@ async fn trust_remove_handler(
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "Manufacturer not in trust list"})),
-        ).into_response();
+        )
+            .into_response();
     }
     save_trust_list(&state.storage_dir, &list);
-    println!("Trusted manufacturer removed: {}", &pk_hex[..16.min(pk_hex.len())]);
+    println!(
+        "Trusted manufacturer removed: {}",
+        &pk_hex[..16.min(pk_hex.len())]
+    );
     (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
 }
 
@@ -3074,32 +3100,63 @@ async fn device_attest_handler(
                     "error": "Manufacturer not in trust list",
                     "manufacturer_pk_hex": req.manufacturer_pk_hex,
                 })),
-            ).into_response();
+            )
+                .into_response();
         }
     }
 
     // Verify the cert is valid (signed by the manufacturer)
     let dev_pk_bytes = match hex::decode(&req.dev_pk_hex) {
         Ok(b) => b,
-        Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid dev_pk_hex"}))).into_response(),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid dev_pk_hex"})),
+            )
+                .into_response()
+        }
     };
     let device_pk_g2_bytes = match hex::decode(&req.device_pk_g2_hex) {
         Ok(b) => b,
-        Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid device_pk_g2_hex"}))).into_response(),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid device_pk_g2_hex"})),
+            )
+                .into_response()
+        }
     };
     let manufacturer_sig_bytes = match hex::decode(&req.manufacturer_sig_hex) {
         Ok(b) => b,
-        Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid manufacturer_sig_hex"}))).into_response(),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid manufacturer_sig_hex"})),
+            )
+                .into_response()
+        }
     };
     let manufacturer_pk_bytes = match hex::decode(&req.manufacturer_pk_hex) {
         Ok(b) => b,
-        Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid manufacturer_pk_hex"}))).into_response(),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid manufacturer_pk_hex"})),
+            )
+                .into_response()
+        }
     };
 
     // Parse manufacturer public key
     let mfr_pk = match p256::PublicKey::from_sec1_bytes(&manufacturer_pk_bytes) {
         Ok(pk) => pk,
-        Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid manufacturer P-256 key"}))).into_response(),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid manufacturer P-256 key"})),
+            )
+                .into_response()
+        }
     };
     let mfr_vk = p256::ecdsa::VerifyingKey::from(&mfr_pk);
 
@@ -3114,23 +3171,37 @@ async fn device_attest_handler(
 
     let sig = match p256::ecdsa::Signature::from_der(&manufacturer_sig_bytes) {
         Ok(s) => s,
-        Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid DER signature"}))).into_response(),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid DER signature"})),
+            )
+                .into_response()
+        }
     };
 
     use p256::ecdsa::signature::Verifier;
     if mfr_vk.verify(&digest, &sig).is_err() {
-        return (StatusCode::FORBIDDEN, Json(serde_json::json!({"error": "certificate verification failed"}))).into_response();
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "certificate verification failed"})),
+        )
+            .into_response();
     }
 
     // Generate challenge nonce
     let mut nonce = [0u8; 32];
     rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut nonce);
 
-    (StatusCode::OK, Json(serde_json::json!({
-        "status": "challenge",
-        "nonce_hex": hex::encode(nonce),
-        "device_pk_g2_hex": req.device_pk_g2_hex,
-    }))).into_response()
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "challenge",
+            "nonce_hex": hex::encode(nonce),
+            "device_pk_g2_hex": req.device_pk_g2_hex,
+        })),
+    )
+        .into_response()
 }
 
 /// POST /api/device-attest/respond -- device sends signed nonce, creator verifies
@@ -3147,7 +3218,13 @@ async fn device_attest_respond_handler(
 ) -> impl IntoResponse {
     let dev_pk_bytes = match hex::decode(&req.dev_pk_hex) {
         Ok(b) => b,
-        Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid dev_pk_hex"}))).into_response(),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid dev_pk_hex"})),
+            )
+                .into_response()
+        }
     };
     let nonce_bytes = match hex::decode(&req.nonce_hex) {
         Ok(b) if b.len() == 32 => {
@@ -3155,17 +3232,35 @@ async fn device_attest_respond_handler(
             arr.copy_from_slice(&b);
             arr
         }
-        _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid nonce_hex"}))).into_response(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid nonce_hex"})),
+            )
+                .into_response()
+        }
     };
     let sig_bytes = match hex::decode(&req.signature_hex) {
         Ok(b) => b,
-        Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid signature_hex"}))).into_response(),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid signature_hex"})),
+            )
+                .into_response()
+        }
     };
 
     // Parse device P-256 public key
     let dev_pk = match p256::PublicKey::from_sec1_bytes(&dev_pk_bytes) {
         Ok(pk) => pk,
-        Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid P-256 device key"}))).into_response(),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid P-256 device key"})),
+            )
+                .into_response()
+        }
     };
     let dev_vk = p256::ecdsa::VerifyingKey::from(&dev_pk);
 
@@ -3174,18 +3269,32 @@ async fn device_attest_respond_handler(
     let digest: [u8; 32] = Sha256Hasher2::digest(nonce_bytes).into();
     let sig = match p256::ecdsa::Signature::from_der(&sig_bytes) {
         Ok(s) => s,
-        Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid DER signature"}))).into_response(),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid DER signature"})),
+            )
+                .into_response()
+        }
     };
 
     use p256::ecdsa::signature::Verifier as Verifier2;
     if dev_vk.verify(&digest, &sig).is_err() {
-        return (StatusCode::FORBIDDEN, Json(serde_json::json!({"error": "challenge verification failed"}))).into_response();
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "challenge verification failed"})),
+        )
+            .into_response();
     }
 
-    (StatusCode::OK, Json(serde_json::json!({
-        "status": "attested",
-        "dev_pk_hex": req.dev_pk_hex,
-    }))).into_response()
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "attested",
+            "dev_pk_hex": req.dev_pk_hex,
+        })),
+    )
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -3263,22 +3372,21 @@ async fn pre_purchase_handler(
     }
 
     // Parse buyer's G2 public key
-    let buyer_pk_bytes = match hex::decode(&req.buyer_pk_hex) {
-        Ok(b) if b.len() == 96 => {
-            let mut arr = [0u8; 96];
-            arr.copy_from_slice(&b);
-            arr
-        }
-        _ => {
-            return (
+    let buyer_pk_bytes =
+        match hex::decode(&req.buyer_pk_hex) {
+            Ok(b) if b.len() == 96 => {
+                let mut arr = [0u8; 96];
+                arr.copy_from_slice(&b);
+                arr
+            }
+            _ => return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
                     "error": "buyer_pk_hex must be 96 bytes (192 hex chars), compressed G2 point"
                 })),
             )
-                .into_response()
-        }
-    };
+                .into_response(),
+        };
 
     let buyer_pk = match pre::deserialize_buyer_pk(&buyer_pk_bytes) {
         Some(pk) => pk,
@@ -5861,7 +5969,10 @@ fn handle_buy_pre(
     };
     let pre_c1_hex = match purchase_resp["pre_c1_hex"].as_str() {
         Some(s) => s.to_string(),
-        None => pre_bail!(emitter, "Creator response missing pre_c1_hex (content may not be PRE-enabled)"),
+        None => pre_bail!(
+            emitter,
+            "Creator response missing pre_c1_hex (content may not be PRE-enabled)"
+        ),
     };
     let pre_c2_hex = match purchase_resp["pre_c2_hex"].as_str() {
         Some(s) => s.to_string(),
@@ -6013,41 +6124,59 @@ fn handle_buy_pre(
                     match remote_node_id.parse::<conduit_p2p::iroh::PublicKey>() {
                         Ok(remote_pk) => {
                             let ep = p2p.endpoint().clone();
-                            let enc_hash_bytes = hex::decode(&enc_hash)
-                                .ok()
-                                .and_then(|b| if b.len() == 32 {
+                            let enc_hash_bytes = hex::decode(&enc_hash).ok().and_then(|b| {
+                                if b.len() == 32 {
                                     let mut arr = [0u8; 32];
                                     arr.copy_from_slice(&b);
                                     Some(arr)
                                 } else {
                                     None
-                                });
+                                }
+                            });
 
                             match enc_hash_bytes {
                                 Some(hash_bytes) => {
                                     let ln_pk = node.node_id().to_string();
-                                    let buyer_client = conduit_p2p::client::BuyerClient::new(
-                                        ep,
-                                        ln_pk,
-                                    );
+                                    let buyer_client =
+                                        conduit_p2p::client::BuyerClient::new(ep, ln_pk);
                                     let addr = conduit_p2p::iroh::EndpointAddr::from(remote_pk);
                                     let rt = tokio::runtime::Runtime::new().unwrap();
                                     // Fetch catalog to know chunk count
-                                    let catalog_url = format!("{}/api/catalog", chunk_source.trim_end_matches('/'));
-                                    let cat_resp = client.get(&catalog_url).send().ok().and_then(|r| r.json::<serde_json::Value>().ok());
-                                    let num_chunks = cat_resp.as_ref().and_then(|cat| {
-                                        let items = cat.as_array().or_else(|| cat["items"].as_array())?;
-                                        let entry = items.iter().find(|e| {
-                                            e["content_hash"].as_str() == Some(content_hash)
-                                                || e["encrypted_hash"].as_str() == Some(content_hash)
-                                        })?;
-                                        entry["chunk_count"].as_u64().or_else(|| entry["total_chunks"].as_u64())
-                                    }).unwrap_or(1) as u32;
+                                    let catalog_url = format!(
+                                        "{}/api/catalog",
+                                        chunk_source.trim_end_matches('/')
+                                    );
+                                    let cat_resp = client
+                                        .get(&catalog_url)
+                                        .send()
+                                        .ok()
+                                        .and_then(|r| r.json::<serde_json::Value>().ok());
+                                    let num_chunks = cat_resp
+                                        .as_ref()
+                                        .and_then(|cat| {
+                                            let items = cat
+                                                .as_array()
+                                                .or_else(|| cat["items"].as_array())?;
+                                            let entry = items.iter().find(|e| {
+                                                e["content_hash"].as_str() == Some(content_hash)
+                                                    || e["encrypted_hash"].as_str()
+                                                        == Some(content_hash)
+                                            })?;
+                                            entry["chunk_count"]
+                                                .as_u64()
+                                                .or_else(|| entry["total_chunks"].as_u64())
+                                        })
+                                        .unwrap_or(1)
+                                        as u32;
 
                                     let indices: Vec<u32> = (0..num_chunks).collect();
                                     struct DirectPayment;
                                     impl conduit_p2p::client::PaymentHandler for DirectPayment {
-                                        fn pay_invoice(&self, _bolt11: &str) -> anyhow::Result<[u8; 32]> {
+                                        fn pay_invoice(
+                                            &self,
+                                            _bolt11: &str,
+                                        ) -> anyhow::Result<[u8; 32]>
+                                        {
                                             // P2P chunks for PRE don't use transport payment —
                                             // the content key payment already happened above.
                                             // Return a dummy preimage to satisfy the protocol.
@@ -6055,7 +6184,12 @@ fn handle_buy_pre(
                                         }
                                     }
 
-                                    match rt.block_on(buyer_client.download(addr, hash_bytes, &indices, &DirectPayment)) {
+                                    match rt.block_on(buyer_client.download(
+                                        addr,
+                                        hash_bytes,
+                                        &indices,
+                                        &DirectPayment,
+                                    )) {
                                         Ok(result) => {
                                             emitter.emit(
                                                 role,
@@ -6066,10 +6200,14 @@ fn handle_buy_pre(
                                                     "message": "Chunks downloaded via P2P!",
                                                 }),
                                             );
-                                            println!("P2P: downloaded {} chunks", result.chunks.len());
+                                            println!(
+                                                "P2P: downloaded {} chunks",
+                                                result.chunks.len()
+                                            );
                                             let mut sorted = result.chunks;
                                             sorted.sort_by_key(|(idx, _)| *idx);
-                                            let data: Vec<u8> = sorted.into_iter().flat_map(|(_, d)| d).collect();
+                                            let data: Vec<u8> =
+                                                sorted.into_iter().flat_map(|(_, d)| d).collect();
                                             Some(data)
                                         }
                                         Err(e) => {
@@ -6081,7 +6219,10 @@ fn handle_buy_pre(
                                                     "message": "P2P download failed, falling back to HTTP.",
                                                 }),
                                             );
-                                            println!("P2P: download failed ({}), falling back to HTTP", e);
+                                            println!(
+                                                "P2P: download failed ({}), falling back to HTTP",
+                                                e
+                                            );
                                             None
                                         }
                                     }
@@ -6110,7 +6251,10 @@ fn handle_buy_pre(
                 Ok(v) => v,
                 Err(e) => pre_bail!(emitter, format!("Invalid catalog JSON: {}", e)),
             },
-            Err(e) => pre_bail!(emitter, format!("Failed to fetch catalog from {}: {}", chunk_source, e)),
+            Err(e) => pre_bail!(
+                emitter,
+                format!("Failed to fetch catalog from {}: {}", chunk_source, e)
+            ),
         };
 
         let catalog_items: Vec<serde_json::Value> = if let Some(arr) = catalog_json.as_array() {
@@ -6128,7 +6272,10 @@ fn handle_buy_pre(
             Some(e) => e.clone(),
             None => pre_bail!(
                 emitter,
-                format!("Content {} not found in catalog at {}", content_hash, chunk_source)
+                format!(
+                    "Content {} not found in catalog at {}",
+                    content_hash, chunk_source
+                )
             ),
         };
 
@@ -6150,7 +6297,10 @@ fn handle_buy_pre(
                 "encrypted_hash": &enc_hash_str,
             }),
         );
-        println!("HTTP: downloading {} chunks from {}...", num_chunks, chunk_source);
+        println!(
+            "HTTP: downloading {} chunks from {}...",
+            num_chunks, chunk_source
+        );
 
         let mut data = Vec::new();
         for i in 0..num_chunks {

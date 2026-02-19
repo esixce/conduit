@@ -199,9 +199,9 @@ fn afgh06_vector_1_full_round_trip_pinned() {
     let buyer = pre::buyer_keygen_from_seed(&[0x0Bu8; 32]);
     let k = Scalar::from(3u64);
     let m: [u8; 32] = [
-        0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
-        0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13, 0x14,
-        0x15, 0x16, 0x17, 0x18,
+        0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+        0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16,
+        0x17, 0x18,
     ];
 
     // Encrypt
@@ -386,7 +386,11 @@ fn ciphertext_serialization_size() {
     let m = [0x42u8; 32];
     let ct = pre::encrypt(&creator.pk, &m);
     let bytes = pre::serialize_ciphertext(&ct);
-    assert_eq!(bytes.len(), 80, "Ciphertext must be 48 (G1) + 32 (c2) = 80 bytes");
+    assert_eq!(
+        bytes.len(),
+        80,
+        "Ciphertext must be 48 (G1) + 32 (c2) = 80 bytes"
+    );
 }
 
 #[test]
@@ -402,5 +406,8 @@ fn ciphertext_serialization_round_trip_preserves_decryption() {
     let rk = pre::re_keygen(&creator.sk, &buyer.pk);
     let re_ct = pre::re_encrypt(&rk.rk_point, &ct2);
     let recovered = pre::decrypt(&buyer.sk, &re_ct);
-    assert_eq!(m, recovered, "Deserialized ciphertext must decrypt correctly");
+    assert_eq!(
+        m, recovered,
+        "Deserialized ciphertext must decrypt correctly"
+    );
 }

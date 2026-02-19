@@ -1,0 +1,28 @@
+[Unit]
+Description=Conduit Node (Peer7)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/conduit
+ExecStart=/root/conduit/target/release/conduit-setup \
+  --storage-dir /var/lib/conduit-node \
+  --port 9742 \
+  --rpc-host 137.184.18.6 --rpc-port 38332 \
+  --rpc-user lightning --rpc-password lightning \
+  --http-port 3007 \
+  --public-ip 68.183.27.110 \
+  --registry-url http://157.230.238.79:3003 \
+  --dashboard /root/conduit-ui/dashboard.html \
+  --alias Peer7 \
+  serve
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=conduit-peer7
+
+[Install]
+WantedBy=multi-user.target

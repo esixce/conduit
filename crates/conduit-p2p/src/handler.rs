@@ -63,41 +63,59 @@ impl ChunkProtocol {
     async fn handle_connection(&self, conn: Connection) -> Result<()> {
         let (mut send, mut recv) = conn.accept_bi().await?;
 
-        let handshake: Message = read_msg(&mut recv).await
-            .context("reading handshake")?;
+        let handshake: Message = read_msg(&mut recv).await.context("reading handshake")?;
 
         let (encrypted_hash, buyer_ln) = match handshake {
             Message::Handshake(h) => {
                 if h.version != Handshake::CURRENT_VERSION {
-                    write_msg(&mut send, &Message::Reject(Reject {
-                        reason: RejectReason::InvalidRequest,
-                    })).await?;
+                    write_msg(
+                        &mut send,
+                        &Message::Reject(Reject {
+                            reason: RejectReason::InvalidRequest,
+                        }),
+                    )
+                    .await?;
                     send.finish()?;
                     anyhow::bail!("unsupported protocol version: {}", h.version);
                 }
                 (h.encrypted_hash, h.lightning_pubkey)
             }
             _ => {
-                write_msg(&mut send, &Message::Reject(Reject {
-                    reason: RejectReason::InvalidRequest,
-                })).await?;
+                write_msg(
+                    &mut send,
+                    &Message::Reject(Reject {
+                        reason: RejectReason::InvalidRequest,
+                    }),
+                )
+                .await?;
                 send.finish()?;
-                anyhow::bail!("expected Handshake, got {:?}", std::mem::discriminant(&handshake));
+                anyhow::bail!(
+                    "expected Handshake, got {:?}",
+                    std::mem::discriminant(&handshake)
+                );
             }
         };
 
-        info!(hash = hex::encode(encrypted_hash), "buyer connected for content");
+        info!(
+            hash = hex::encode(encrypted_hash),
+            "buyer connected for content"
+        );
 
-        let bitfield = self.store.get_bitfield(&encrypted_hash)
+        let bitfield = self
+            .store
+            .get_bitfield(&encrypted_hash)
             .context("content not found")?;
         write_msg(&mut send, &Message::Bitfield(bitfield)).await?;
 
         {
             let mut sessions = self.sessions.lock().unwrap();
-            sessions.insert(encrypted_hash, SessionState {
-                pending_indices: Vec::new(),
-                invoice_issued: false,
-            });
+            sessions.insert(
+                encrypted_hash,
+                SessionState {
+                    pending_indices: Vec::new(),
+                    invoice_issued: false,
+                },
+            );
         }
 
         loop {
@@ -113,21 +131,25 @@ impl ChunkProtocol {
                 Message::Request(req) => {
                     debug!(count = req.indices.len(), "chunk request received");
 
-                    let all_available = req.indices.iter().all(|&i| {
-                        self.store.get_chunk(&encrypted_hash, i).is_some()
-                    });
+                    let all_available = req
+                        .indices
+                        .iter()
+                        .all(|&i| self.store.get_chunk(&encrypted_hash, i).is_some());
                     if !all_available {
-                        write_msg(&mut send, &Message::Reject(Reject {
-                            reason: RejectReason::ChunksUnavailable,
-                        })).await?;
+                        write_msg(
+                            &mut send,
+                            &Message::Reject(Reject {
+                                reason: RejectReason::ChunksUnavailable,
+                            }),
+                        )
+                        .await?;
                         continue;
                     }
 
-                    match self.store.create_invoice(
-                        &encrypted_hash,
-                        &req.indices,
-                        &buyer_ln,
-                    ) {
+                    match self
+                        .store
+                        .create_invoice(&encrypted_hash, &req.indices, &buyer_ln)
+                    {
                         Ok((bolt11, amount_msat)) => {
                             {
                                 let mut sessions = self.sessions.lock().unwrap();
@@ -136,26 +158,38 @@ impl ChunkProtocol {
                                     s.invoice_issued = true;
                                 }
                             }
-                            write_msg(&mut send, &Message::Invoice(ChunkInvoice {
-                                bolt11,
-                                amount_msat,
-                                chunk_count: req.indices.len() as u32,
-                            })).await?;
+                            write_msg(
+                                &mut send,
+                                &Message::Invoice(ChunkInvoice {
+                                    bolt11,
+                                    amount_msat,
+                                    chunk_count: req.indices.len() as u32,
+                                }),
+                            )
+                            .await?;
                         }
                         Err(e) => {
                             warn!("invoice creation failed: {e}");
-                            write_msg(&mut send, &Message::Reject(Reject {
-                                reason: RejectReason::PaymentRequired,
-                            })).await?;
+                            write_msg(
+                                &mut send,
+                                &Message::Reject(Reject {
+                                    reason: RejectReason::PaymentRequired,
+                                }),
+                            )
+                            .await?;
                         }
                     }
                 }
 
                 Message::PaymentProof(proof) => {
                     if !self.store.verify_payment(&encrypted_hash, &proof.preimage) {
-                        write_msg(&mut send, &Message::Reject(Reject {
-                            reason: RejectReason::PaymentRequired,
-                        })).await?;
+                        write_msg(
+                            &mut send,
+                            &Message::Reject(Reject {
+                                reason: RejectReason::PaymentRequired,
+                            }),
+                        )
+                        .await?;
                         continue;
                     }
 
@@ -163,7 +197,8 @@ impl ChunkProtocol {
 
                     let indices = {
                         let sessions = self.sessions.lock().unwrap();
-                        sessions.get(&encrypted_hash)
+                        sessions
+                            .get(&encrypted_hash)
                             .map(|s| s.pending_indices.clone())
                             .unwrap_or_default()
                     };
@@ -173,14 +208,20 @@ impl ChunkProtocol {
                             Some(d) => d,
                             None => continue,
                         };
-                        let proof_nodes = self.store.get_proof(&encrypted_hash, idx)
+                        let proof_nodes = self
+                            .store
+                            .get_proof(&encrypted_hash, idx)
                             .unwrap_or_default();
 
-                        write_msg(&mut send, &Message::Chunk(ChunkData {
-                            chunk_index: idx,
-                            data,
-                            proof: proof_nodes,
-                        })).await?;
+                        write_msg(
+                            &mut send,
+                            &Message::Chunk(ChunkData {
+                                chunk_index: idx,
+                                data,
+                                proof: proof_nodes,
+                            }),
+                        )
+                        .await?;
                     }
 
                     {
