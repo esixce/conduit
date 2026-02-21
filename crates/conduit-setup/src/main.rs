@@ -6190,25 +6190,35 @@ fn handle_buy_pre(
                                         as u32;
 
                                     let indices: Vec<u32> = (0..num_chunks).collect();
-                                    struct DirectPayment;
-                                    impl conduit_p2p::client::PaymentHandler for DirectPayment {
+                                    struct LdkPaymentHandler {
+                                        node: Arc<Node>,
+                                    }
+                                    impl conduit_p2p::client::PaymentHandler for LdkPaymentHandler {
                                         fn pay_invoice(
                                             &self,
-                                            _bolt11: &str,
+                                            bolt11: &str,
                                         ) -> anyhow::Result<[u8; 32]>
                                         {
-                                            // P2P chunks for PRE don't use transport payment —
-                                            // the content key payment already happened above.
-                                            // Return a dummy preimage to satisfy the protocol.
-                                            Ok([0u8; 32])
+                                            let payment_hash =
+                                                invoice::pay_invoice(&self.node, bolt11)
+                                                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                                            let result = invoice::wait_for_outbound_payment(
+                                                &self.node,
+                                                &payment_hash,
+                                            )
+                                            .map_err(|e| anyhow::anyhow!("{e}"))?;
+                                            Ok(result.preimage)
                                         }
                                     }
+                                    let payment_handler = LdkPaymentHandler {
+                                        node: Arc::clone(node),
+                                    };
 
                                     match rt.block_on(buyer_client.download(
                                         addr,
                                         hash_bytes,
                                         &indices,
-                                        &DirectPayment,
+                                        &payment_handler,
                                     )) {
                                         Ok(result) => {
                                             emitter.emit(

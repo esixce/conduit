@@ -18,6 +18,7 @@ ExecStart=/root/conduit/target/release/conduit-setup \
   --dashboard /root/conduit/dashboard.html \
   --ads-dir /var/lib/conduit-seeder2/ads \
   --alias Seeder2 \
+  --p2p \
   serve
 Restart=on-failure
 RestartSec=5
