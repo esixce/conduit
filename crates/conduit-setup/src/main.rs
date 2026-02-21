@@ -2888,10 +2888,13 @@ async fn p2p_info_handler(State(state): State<AppState>) -> impl IntoResponse {
     match &state.p2p_node {
         Some(p2p) => {
             let addr = p2p.endpoint_addr();
+            let direct_addrs: Vec<String> = addr.ip_addrs().map(|a| a.to_string()).collect();
+            let relay_urls: Vec<String> = addr.relay_urls().map(|u| u.to_string()).collect();
             Json(serde_json::json!({
                 "enabled": true,
                 "node_id": p2p.node_id().to_string(),
-                "endpoint_addr": format!("{:?}", addr),
+                "direct_addrs": direct_addrs,
+                "relay_urls": relay_urls,
             }))
             .into_response()
         }
@@ -5779,6 +5782,20 @@ fn handle_buy(
     }
 
     // 4. Pay invoice
+    //
+    // Register event listener BEFORE sending to avoid race: direct-channel
+    // payments can settle in <1s.
+    let pre_hash = {
+        use ldk_node::lightning_invoice::Bolt11Invoice;
+        let inv: Bolt11Invoice = bolt11_str.parse().expect("Invalid bolt11");
+        let h: &[u8] = inv.payment_hash().as_ref();
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(h);
+        arr
+    };
+    let target_hash = PaymentHash(pre_hash);
+    let rx = router.register(target_hash);
+
     emitter.emit(
         role,
         "PAYING_INVOICE",
@@ -5787,7 +5804,6 @@ fn handle_buy(
         }),
     );
     let hash_bytes = invoice::pay_invoice(node, bolt11_str).expect("Failed to pay invoice");
-    let target_hash = PaymentHash(hash_bytes);
     emitter.emit(
         role,
         "PAYMENT_SENT",
@@ -5797,9 +5813,8 @@ fn handle_buy(
         }),
     );
 
-    // 4. Wait for preimage via event router
+    // Wait for preimage via event router (rx was registered before send)
     let preimage_bytes: [u8; 32];
-    let rx = router.register(target_hash);
     loop {
         let event = rx.recv().expect("Event router dropped");
         match event {
@@ -6030,12 +6045,10 @@ fn handle_buy_pre(
     }
 
     // 3. Pay the Lightning invoice (with retry + DuplicatePayment recovery)
-    emitter.emit(
-        role,
-        "PAYING_INVOICE",
-        serde_json::json!({ "bolt11": &bolt11 }),
-    );
-
+    //
+    // Register the event listener BEFORE sending payment to avoid a race
+    // where PaymentSuccessful fires before we start listening (direct
+    // channels settle in <1s).
     let pre_payment_hash = {
         use ldk_node::lightning_invoice::Bolt11Invoice;
         let inv: Bolt11Invoice = bolt11.parse().expect("Invalid bolt11 in PRE flow");
@@ -6044,6 +6057,14 @@ fn handle_buy_pre(
         arr.copy_from_slice(h);
         arr
     };
+    let target_hash = PaymentHash(pre_payment_hash);
+    let rx = router.register(target_hash);
+
+    emitter.emit(
+        role,
+        "PAYING_INVOICE",
+        serde_json::json!({ "bolt11": &bolt11 }),
+    );
 
     let hash_bytes = match invoice::pay_invoice_with_retry(node, &bolt11, 3, Duration::from_secs(3))
     {
@@ -6092,6 +6113,7 @@ fn handle_buy_pre(
                         pre_payment_hash
                     }
                     None => {
+                        router.unregister(&target_hash);
                         pre_bail!(
                             emitter,
                             "DuplicatePayment but preimage not found in history. Try again (new invoice will have a unique hash)."
@@ -6099,6 +6121,7 @@ fn handle_buy_pre(
                     }
                 }
             } else {
+                router.unregister(&target_hash);
                 let usable_channels: Vec<String> = node
                     .list_channels()
                     .iter()
@@ -6128,7 +6151,6 @@ fn handle_buy_pre(
         }
     };
 
-    let target_hash = PaymentHash(hash_bytes);
     emitter.emit(
         role,
         "PAYMENT_SENT",
@@ -6138,8 +6160,7 @@ fn handle_buy_pre(
         }),
     );
 
-    // 4. Wait for payment confirmation
-    let rx = router.register(target_hash);
+    // 4. Wait for payment confirmation (rx was registered before send)
     loop {
         let event = match rx.recv() {
             Ok(e) => e,
@@ -6219,19 +6240,63 @@ fn handle_buy_pre(
             Ok(r) => match r.json::<serde_json::Value>() {
                 Ok(info) if info["enabled"].as_bool() == Some(true) => {
                     let remote_node_id = info["node_id"].as_str().unwrap_or("").to_string();
+                    let direct_addrs: Vec<String> = info["direct_addrs"]
+                        .as_array()
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|v| v.as_str().map(String::from))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let relay_urls: Vec<String> = info["relay_urls"]
+                        .as_array()
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|v| v.as_str().map(String::from))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+
                     emitter.emit(
                         role,
                         "P2P_CONNECTING",
                         serde_json::json!({
                             "remote_node_id": &remote_node_id,
-                            "message": "Connecting to seeder via P2P (iroh QUIC)...",
+                            "direct_addrs": &direct_addrs,
+                            "relay_urls": &relay_urls,
+                            "message": format!("Connecting to seeder via P2P (iroh QUIC)... addrs={}", direct_addrs.join(", ")),
                         }),
                     );
-                    println!("P2P: connecting to seeder {}", &remote_node_id[..16]);
+                    eprintln!(
+                        "P2P: connecting to seeder {} addrs={:?} relays={:?}",
+                        &remote_node_id[..16.min(remote_node_id.len())],
+                        &direct_addrs,
+                        &relay_urls
+                    );
 
-                    // Parse remote node ID into iroh EndpointId
-                    match remote_node_id.parse::<conduit_p2p::iroh::PublicKey>() {
-                        Ok(remote_pk) => {
+                    // Build EndpointAddr with the public key, direct IP addrs, and relay URLs
+                    // so iroh can connect directly instead of relying on slow DHT discovery.
+                    let addr_parse_result: Result<conduit_p2p::iroh::EndpointAddr, String> =
+                        (|| {
+                            let pk = remote_node_id
+                                .parse::<conduit_p2p::iroh::PublicKey>()
+                                .map_err(|e| format!("PublicKey parse: {e}"))?;
+                            let mut addr = conduit_p2p::iroh::EndpointAddr::from(pk);
+                            for s in &direct_addrs {
+                                if let Ok(sa) = s.parse::<std::net::SocketAddr>() {
+                                    addr = addr.with_ip_addr(sa);
+                                }
+                            }
+                            for u in &relay_urls {
+                                if let Ok(ru) = u.parse::<conduit_p2p::iroh::RelayUrl>() {
+                                    addr = addr.with_relay_url(ru);
+                                }
+                            }
+                            Ok(addr)
+                        })();
+
+                    match addr_parse_result {
+                        Ok(addr) => {
                             let ep = p2p.endpoint().clone();
                             let enc_hash_bytes = hex::decode(&enc_hash).ok().and_then(|b| {
                                 if b.len() == 32 {
@@ -6248,7 +6313,6 @@ fn handle_buy_pre(
                                     let ln_pk = node.node_id().to_string();
                                     let buyer_client =
                                         conduit_p2p::client::BuyerClient::new(ep, ln_pk);
-                                    let addr = conduit_p2p::iroh::EndpointAddr::from(remote_pk);
                                     let rt = tokio::runtime::Runtime::new().unwrap();
                                     // Fetch catalog to know chunk count
                                     let catalog_url = format!(
@@ -6281,6 +6345,7 @@ fn handle_buy_pre(
                                     let indices: Vec<u32> = (0..num_chunks).collect();
                                     struct LdkPaymentHandler {
                                         node: Arc<Node>,
+                                        router: Arc<EventRouter>,
                                     }
                                     impl conduit_p2p::client::PaymentHandler for LdkPaymentHandler {
                                         fn pay_invoice(
@@ -6288,19 +6353,49 @@ fn handle_buy_pre(
                                             bolt11: &str,
                                         ) -> anyhow::Result<[u8; 32]>
                                         {
-                                            let payment_hash =
+                                            use ldk_node::lightning_invoice::Bolt11Invoice;
+                                            let inv: Bolt11Invoice = bolt11.parse()
+                                                .map_err(|e: ldk_node::lightning_invoice::ParseOrSemanticError| {
+                                                    anyhow::anyhow!("bad bolt11: {e}")
+                                                })?;
+                                            let h: &[u8] = inv.payment_hash().as_ref();
+                                            let mut hash = [0u8; 32];
+                                            hash.copy_from_slice(h);
+                                            let target = PaymentHash(hash);
+
+                                            let rx = self.router.register(target);
+
+                                            let _payment_hash =
                                                 invoice::pay_invoice(&self.node, bolt11)
                                                     .map_err(|e| anyhow::anyhow!("{e}"))?;
-                                            let result = invoice::wait_for_outbound_payment(
-                                                &self.node,
-                                                &payment_hash,
-                                            )
-                                            .map_err(|e| anyhow::anyhow!("{e}"))?;
-                                            Ok(result.preimage)
+
+                                            loop {
+                                                let event = rx.recv().map_err(|_| {
+                                                    anyhow::anyhow!("event router dropped")
+                                                })?;
+                                                match event {
+                                                    Event::PaymentSuccessful {
+                                                        payment_preimage: Some(pre),
+                                                        ..
+                                                    } => {
+                                                        self.router.unregister(&target);
+                                                        return Ok(pre.0);
+                                                    }
+                                                    Event::PaymentFailed { reason, .. } => {
+                                                        self.router.unregister(&target);
+                                                        return Err(anyhow::anyhow!(
+                                                            "P2P chunk payment failed: {:?}",
+                                                            reason
+                                                        ));
+                                                    }
+                                                    _ => {}
+                                                }
+                                            }
                                         }
                                     }
                                     let payment_handler = LdkPaymentHandler {
                                         node: Arc::clone(node),
+                                        router: Arc::clone(router),
                                     };
 
                                     match rt.block_on(buyer_client.download(
@@ -6349,7 +6444,10 @@ fn handle_buy_pre(
                                 None => None,
                             }
                         }
-                        Err(_) => None,
+                        Err(e) => {
+                            eprintln!("P2P: address parse failed: {e}");
+                            None
+                        }
                     }
                 }
                 _ => None,
