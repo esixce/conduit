@@ -6029,16 +6029,105 @@ fn handle_buy_pre(
         thread::sleep(Duration::from_secs(1));
     }
 
-    // 3. Pay the Lightning invoice
+    // 3. Pay the Lightning invoice (with retry + DuplicatePayment recovery)
     emitter.emit(
         role,
         "PAYING_INVOICE",
         serde_json::json!({ "bolt11": &bolt11 }),
     );
-    let hash_bytes = match invoice::pay_invoice(node, &bolt11) {
-        Ok(h) => h,
-        Err(e) => pre_bail!(emitter, format!("Failed to pay invoice: {:?}", e)),
+
+    let pre_payment_hash = {
+        use ldk_node::lightning_invoice::Bolt11Invoice;
+        let inv: Bolt11Invoice = bolt11.parse().expect("Invalid bolt11 in PRE flow");
+        let h: &[u8] = inv.payment_hash().as_ref();
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(h);
+        arr
     };
+
+    let hash_bytes = match invoice::pay_invoice_with_retry(node, &bolt11, 3, Duration::from_secs(3))
+    {
+        Ok(h) => h,
+        Err(e) => {
+            let err_str = format!("{:?}", e);
+            if err_str.contains("DuplicatePayment") {
+                eprintln!("[buy-pre] DuplicatePayment — looking up preimage from history");
+                emitter.emit(
+                    role,
+                    "PRE_ALREADY_PAID",
+                    serde_json::json!({
+                        "message": "DuplicatePayment — looking up preimage from history...",
+                    }),
+                );
+
+                let target = PaymentHash(pre_payment_hash);
+                let mut found_preimage: Option<[u8; 32]> = None;
+                for p in node.list_payments_with_filter(|p| {
+                    p.direction == PaymentDirection::Outbound
+                        && p.status == PaymentStatus::Succeeded
+                }) {
+                    if let PaymentKind::Bolt11 {
+                        hash,
+                        preimage: Some(pre),
+                        ..
+                    } = &p.kind
+                    {
+                        if *hash == target {
+                            found_preimage = Some(pre.0);
+                            break;
+                        }
+                    }
+                }
+
+                match found_preimage {
+                    Some(_preimage) => {
+                        emitter.emit(
+                            role,
+                            "PRE_PAYMENT_CONFIRMED",
+                            serde_json::json!({
+                                "payment_hash": hex::encode(pre_payment_hash),
+                                "message": "PRE payment recovered from history.",
+                            }),
+                        );
+                        pre_payment_hash
+                    }
+                    None => {
+                        pre_bail!(
+                            emitter,
+                            "DuplicatePayment but preimage not found in history. Try again (new invoice will have a unique hash)."
+                        );
+                    }
+                }
+            } else {
+                let usable_channels: Vec<String> = node
+                    .list_channels()
+                    .iter()
+                    .filter(|c| c.is_usable)
+                    .map(|c| {
+                        format!(
+                            "{}… out={}",
+                            &c.counterparty_node_id.to_string()[..16],
+                            c.outbound_capacity_msat / 1000
+                        )
+                    })
+                    .collect();
+                eprintln!(
+                    "[buy-pre] payment failed after retries: {} | usable channels: {:?}",
+                    err_str, usable_channels
+                );
+                emitter.emit(
+                    role,
+                    "BUY_ERROR",
+                    serde_json::json!({
+                        "message": format!("Failed to pay invoice: {}", err_str),
+                        "usable_channels": usable_channels,
+                    }),
+                );
+                return;
+            }
+        }
+    };
+
     let target_hash = PaymentHash(hash_bytes);
     emitter.emit(
         role,
