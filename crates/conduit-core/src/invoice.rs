@@ -260,6 +260,88 @@ pub fn pay_invoice(node: &Node, bolt11: &str) -> Result<[u8; 32], InvoiceError> 
     Ok(hash)
 }
 
+/// Pay a BOLT 11 invoice with automatic retry on transient failures.
+///
+/// Retries up to `max_retries` times with `delay` between attempts when
+/// `PaymentSendingFailed` (RouteNotFound) occurs — this covers the common
+/// case where LDK's peer connections haven't fully re-established after a
+/// node restart.
+///
+/// `DuplicatePayment` is returned immediately (no retry — caller should
+/// look up the preimage from payment history).
+pub fn pay_invoice_with_retry(
+    node: &Node,
+    bolt11: &str,
+    max_retries: u32,
+    delay: std::time::Duration,
+) -> Result<[u8; 32], InvoiceError> {
+    use ldk_node::lightning_invoice::Bolt11Invoice;
+
+    let invoice: Bolt11Invoice =
+        bolt11
+            .parse()
+            .map_err(|e: ldk_node::lightning_invoice::ParseOrSemanticError| {
+                InvoiceError::InvoiceParse(e.to_string())
+            })?;
+
+    let hash_bytes: &[u8] = invoice.payment_hash().as_ref();
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(hash_bytes);
+
+    let payee = invoice
+        .payee_pub_key()
+        .map(|pk| pk.to_string())
+        .unwrap_or_else(|| "unknown".into());
+
+    let usable = node.list_channels().iter().filter(|c| c.is_usable).count();
+    let has_direct = node
+        .list_channels()
+        .iter()
+        .any(|c| c.is_usable && c.counterparty_node_id.to_string() == payee);
+
+    eprintln!(
+        "[pay] payee={} usable_channels={} direct_channel={} amount_hash={}",
+        &payee[..16.min(payee.len())],
+        usable,
+        has_direct,
+        hex::encode(hash),
+    );
+
+    let mut last_err = None;
+    for attempt in 1..=(max_retries + 1) {
+        match node.bolt11_payment().send(&invoice, None) {
+            Ok(_payment_id) => {
+                if attempt > 1 {
+                    eprintln!("[pay] succeeded on attempt {}", attempt);
+                }
+                return Ok(hash);
+            }
+            Err(e) => {
+                let err_str = format!("{:?}", e);
+                eprintln!(
+                    "[pay] attempt {}/{} failed: {}",
+                    attempt,
+                    max_retries + 1,
+                    err_str
+                );
+
+                if err_str.contains("DuplicatePayment") {
+                    return Err(InvoiceError::Ldk(e));
+                }
+
+                last_err = Some(e);
+
+                if attempt <= max_retries {
+                    eprintln!("[pay] retrying in {}ms...", delay.as_millis());
+                    std::thread::sleep(delay);
+                }
+            }
+        }
+    }
+
+    Err(InvoiceError::Ldk(last_err.unwrap()))
+}
+
 // ---------------------------------------------------------------------------
 // Event loops
 // ---------------------------------------------------------------------------
