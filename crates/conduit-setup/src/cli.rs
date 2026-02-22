@@ -5,70 +5,70 @@ use clap::{Parser, Subcommand};
 #[command(about = "Conduit Lightning node with live console")]
 pub struct Cli {
     /// Storage directory for LDK node data
-    #[arg(long, default_value = "/var/lib/conduit-node")]
+    #[arg(long, default_value = "/var/lib/conduit-node", env = "CONDUIT_STORAGE_DIR")]
     pub storage_dir: String,
 
     /// Lightning listening port
-    #[arg(long, default_value = "9735")]
+    #[arg(long, default_value = "9735", env = "CONDUIT_PORT")]
     pub port: u16,
 
     /// Esplora server URL
-    #[arg(long)]
+    #[arg(long, env = "CONDUIT_ESPLORA")]
     pub esplora: Option<String>,
 
     /// Bitcoind RPC host
-    #[arg(long)]
+    #[arg(long, env = "CONDUIT_RPC_HOST")]
     pub rpc_host: Option<String>,
 
     /// Bitcoind RPC port
-    #[arg(long, default_value = "38332")]
+    #[arg(long, default_value = "38332", env = "CONDUIT_RPC_PORT")]
     pub rpc_port: u16,
 
     /// Bitcoind RPC username
-    #[arg(long, default_value = "lightning")]
+    #[arg(long, default_value = "lightning", env = "CONDUIT_RPC_USER")]
     pub rpc_user: String,
 
     /// Bitcoind RPC password
-    #[arg(long, default_value = "lightning")]
+    #[arg(long, default_value = "lightning", env = "CONDUIT_RPC_PASSWORD")]
     pub rpc_password: String,
 
     /// HTTP port for the live console (off if not set)
-    #[arg(long)]
+    #[arg(long, env = "CONDUIT_HTTP_PORT")]
     pub http_port: Option<u16>,
 
     /// Registry URL for content discovery (optional, e.g. http://localhost:3003)
-    #[arg(long)]
+    #[arg(long, env = "CONDUIT_REGISTRY_URL")]
     pub registry_url: Option<String>,
 
     /// Public IP/hostname for this node (used in registry announcements).
     /// If omitted, attempts to detect via external service.
-    #[arg(long)]
+    #[arg(long, env = "CONDUIT_PUBLIC_IP")]
     pub public_ip: Option<String>,
 
     /// Enable advertiser role. Value is an arbitrary label (e.g. "enabled").
     /// Advertisers host creative media on their own servers and register
     /// campaigns via the API with a creative_url.
-    #[arg(long)]
+    #[arg(long, env = "CONDUIT_ADS_DIR")]
     pub ads_dir: Option<String>,
 
     /// Human-readable node alias (max 32 bytes). Shown in network explorers
     /// and the dashboard network visualization.
-    #[arg(long)]
+    #[arg(long, env = "CONDUIT_ALIAS")]
     pub alias: Option<String>,
 
     /// Path to dashboard HTML file (unified UI). If set, GET / serves this
     /// file instead of the embedded console HTML.
-    #[arg(long)]
+    #[arg(long, env = "CONDUIT_DASHBOARD")]
     pub dashboard: Option<String>,
 
     /// Path to Vite build output directory. If set, serves the built
     /// frontend from this directory instead of the individual dashboard files.
-    #[arg(long)]
+    #[arg(long, env = "CONDUIT_UI_DIST")]
     pub ui_dist: Option<String>,
 
     /// Enable P2P chunk transport (iroh QUIC). When set, the node also
     /// listens for direct peer connections in addition to HTTP.
-    #[arg(long)]
+    #[arg(long, env = "CONDUIT_P2P")]
     pub p2p: bool,
 
     #[command(subcommand)]
