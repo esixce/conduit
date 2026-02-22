@@ -19,6 +19,7 @@ ExecStart=/root/conduit/target/release/conduit-setup \
   --alias Buyer \
   --p2p \
   serve
+Environment=RUST_LOG=iroh=debug,conduit=debug
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal

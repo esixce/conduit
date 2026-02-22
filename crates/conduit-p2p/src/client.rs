@@ -50,11 +50,13 @@ impl BuyerClient {
         desired_indices: &[u32],
         payment: &dyn PaymentHandler,
     ) -> Result<DownloadResult> {
-        let conn = self
-            .endpoint
-            .connect(seeder_addr, crate::CONDUIT_ALPN)
-            .await
-            .context("connecting to seeder")?;
+        let conn = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            self.endpoint.connect(seeder_addr, crate::CONDUIT_ALPN),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("P2P connect timed out after 15s"))?
+        .context("connecting to seeder")?;
 
         info!(hash = hex::encode(encrypted_hash), "connected to seeder");
 
