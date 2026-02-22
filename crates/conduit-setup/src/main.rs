@@ -341,6 +341,7 @@ struct AppState {
     dashboard_path: Option<String>,
     // P2P (iroh)
     p2p_node: Option<Arc<conduit_p2p::node::P2pNode>>,
+    p2p_runtime_handle: Option<tokio::runtime::Handle>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1002,6 +1003,7 @@ async fn buy_pre_handler(
     let router = state.event_router.clone();
     let storage_dir = state.storage_dir.clone();
     let p2p_node = state.p2p_node.clone();
+    let p2p_rt = state.p2p_runtime_handle.clone();
 
     // Derive buyer PRE keypair (same seed as startup)
     let buyer_kp = {
@@ -1030,6 +1032,7 @@ async fn buy_pre_handler(
             req.seeder_url.as_deref(),
             &req.output,
             p2p_node,
+            p2p_rt,
         );
     });
     Json(serde_json::json!({"status": "started"}))
@@ -2905,6 +2908,176 @@ async fn p2p_info_handler(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 
+/// GET /api/p2p-test?target=http://host:port -- test P2P connectivity to a remote node.
+///
+/// Fetches the target's /api/p2p-info, builds an EndpointAddr, and attempts
+/// endpoint.connect() with a 10s timeout. Returns timing and diagnostic info.
+async fn p2p_test_handler(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let target = match params.get("target") {
+        Some(t) => t.clone(),
+        None => {
+            return Json(serde_json::json!({
+                "error": "missing ?target=http://host:port query parameter"
+            }))
+            .into_response();
+        }
+    };
+
+    let p2p = match &state.p2p_node {
+        Some(p) => p.clone(),
+        None => {
+            return Json(serde_json::json!({
+                "error": "P2P is not enabled on this node"
+            }))
+            .into_response();
+        }
+    };
+
+    let p2p_rt = match &state.p2p_runtime_handle {
+        Some(h) => h.clone(),
+        None => {
+            return Json(serde_json::json!({
+                "error": "P2P runtime handle not available"
+            }))
+            .into_response();
+        }
+    };
+
+    let info_url = format!("{}/api/p2p-info", target.trim_end_matches('/'));
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return Json(serde_json::json!({
+                "error": format!("failed to build HTTP client: {e}")
+            }))
+            .into_response();
+        }
+    };
+
+    let info_resp = match client.get(&info_url).send().await {
+        Ok(r) => match r.json::<serde_json::Value>().await {
+            Ok(v) => v,
+            Err(e) => {
+                return Json(serde_json::json!({
+                    "error": format!("failed to parse p2p-info JSON: {e}")
+                }))
+                .into_response();
+            }
+        },
+        Err(e) => {
+            return Json(serde_json::json!({
+                "error": format!("failed to fetch {info_url}: {e}")
+            }))
+            .into_response();
+        }
+    };
+
+    if info_resp["enabled"].as_bool() != Some(true) {
+        return Json(serde_json::json!({
+            "error": "target node does not have P2P enabled",
+            "remote_info": info_resp,
+        }))
+        .into_response();
+    }
+
+    let remote_node_id = info_resp["node_id"].as_str().unwrap_or("").to_string();
+    let direct_addrs: Vec<String> = info_resp["direct_addrs"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let relay_urls: Vec<String> = info_resp["relay_urls"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+
+    let addr = match remote_node_id.parse::<conduit_p2p::iroh::PublicKey>() {
+        Ok(pk) => {
+            let mut a = conduit_p2p::iroh::EndpointAddr::from(pk);
+            for s in &direct_addrs {
+                if let Ok(sa) = s.parse::<std::net::SocketAddr>() {
+                    a = a.with_ip_addr(sa);
+                }
+            }
+            for u in &relay_urls {
+                if let Ok(ru) = u.parse::<conduit_p2p::iroh::RelayUrl>() {
+                    a = a.with_relay_url(ru);
+                }
+            }
+            a
+        }
+        Err(e) => {
+            return Json(serde_json::json!({
+                "error": format!("failed to parse remote node id: {e}"),
+                "remote_node_id": remote_node_id,
+            }))
+            .into_response();
+        }
+    };
+
+    let ep = p2p.endpoint().clone();
+    let start = std::time::Instant::now();
+
+    let connect_result = p2p_rt.spawn(async move {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            ep.connect(addr, conduit_p2p::CONDUIT_ALPN),
+        )
+        .await
+    });
+
+    match connect_result.await {
+        Ok(Ok(Ok(conn))) => {
+            let elapsed = start.elapsed();
+            conn.close(0u8.into(), b"test");
+            Json(serde_json::json!({
+                "status": "ok",
+                "remote_node_id": remote_node_id,
+                "direct_addrs": direct_addrs,
+                "relay_urls": relay_urls,
+                "connect_ms": elapsed.as_millis(),
+                "message": format!("Connected in {}ms", elapsed.as_millis()),
+            }))
+            .into_response()
+        }
+        Ok(Ok(Err(e))) => {
+            let elapsed = start.elapsed();
+            Json(serde_json::json!({
+                "status": "connect_failed",
+                "remote_node_id": remote_node_id,
+                "direct_addrs": direct_addrs,
+                "relay_urls": relay_urls,
+                "elapsed_ms": elapsed.as_millis(),
+                "error": format!("{e}"),
+            }))
+            .into_response()
+        }
+        Ok(Err(_)) => {
+            Json(serde_json::json!({
+                "status": "timeout",
+                "remote_node_id": remote_node_id,
+                "direct_addrs": direct_addrs,
+                "relay_urls": relay_urls,
+                "elapsed_ms": 10000,
+                "error": "P2P connect timed out after 10s",
+            }))
+            .into_response()
+        }
+        Err(e) => {
+            Json(serde_json::json!({
+                "status": "runtime_error",
+                "error": format!("tokio join error: {e}"),
+            }))
+            .into_response()
+        }
+    }
+}
+
 fn start_http_server(port: u16, state: AppState) {
     thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
@@ -2999,8 +3172,9 @@ fn start_http_server(port: u16, state: AppState) {
                     "/api/device-attest/respond",
                     post(device_attest_respond_handler),
                 )
-                // P2P info
+                // P2P info and diagnostics
                 .route("/api/p2p-info", get(p2p_info_handler))
+                .route("/api/p2p-test", get(p2p_test_handler))
                 .layer(CorsLayer::permissive())
                 .with_state(state);
             let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port))
@@ -5947,6 +6121,7 @@ fn handle_buy_pre(
     seeder_url: Option<&str>,
     output_path: &str,
     p2p_node: Option<Arc<conduit_p2p::node::P2pNode>>,
+    p2p_runtime_handle: Option<tokio::runtime::Handle>,
 ) {
     let role = "buyer";
     let buyer_pk_hex = hex::encode(pre::serialize_buyer_pk(&buyer_kp.pk));
@@ -6313,7 +6488,6 @@ fn handle_buy_pre(
                                     let ln_pk = node.node_id().to_string();
                                     let buyer_client =
                                         conduit_p2p::client::BuyerClient::new(ep, ln_pk);
-                                    let rt = tokio::runtime::Runtime::new().unwrap();
                                     // Fetch catalog to know chunk count
                                     let catalog_url = format!(
                                         "{}/api/catalog",
@@ -6398,7 +6572,8 @@ fn handle_buy_pre(
                                         router: Arc::clone(router),
                                     };
 
-                                    match rt.block_on(buyer_client.download(
+                                    let p2p_rt = p2p_runtime_handle.as_ref().expect("P2P runtime handle must exist when p2p_node is Some");
+                                    match p2p_rt.block_on(buyer_client.download(
                                         addr,
                                         hash_bytes,
                                         &indices,
@@ -6993,6 +7168,7 @@ fn main() {
             ads_dir: adv_ads_dir,
             dashboard_path: cli.dashboard.clone(),
             p2p_node: None,
+            p2p_runtime_handle: None,
         };
 
         // Spawn P2P node if --p2p flag is set
@@ -7019,6 +7195,7 @@ fn main() {
             };
 
             let rt = tokio::runtime::Runtime::new().expect("P2P tokio runtime");
+            let p2p_handle = rt.handle().clone();
             let p2p_node = rt.block_on(async {
                 conduit_p2p::node::P2pNode::spawn(p2p_config, handler)
                     .await
@@ -7027,6 +7204,7 @@ fn main() {
             let node_id = p2p_node.node_id();
             println!("P2P:     iroh node {} (QUIC, DHT-enabled)", node_id);
             state.p2p_node = Some(Arc::new(p2p_node));
+            state.p2p_runtime_handle = Some(p2p_handle);
 
             // Keep the P2P runtime alive in a background thread
             thread::spawn(move || {
@@ -7184,6 +7362,7 @@ fn main() {
                 &content_hash,
                 seeder_url.as_deref(),
                 &output,
+                None,
                 None,
             );
         }
