@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use conduit_core::merkle::MerkleTree;
 use conduit_p2p::handler::{ChunkProtocol, ChunkStore};
 use conduit_p2p::wire::{Bitfield, ProofNode};
 use conduit_p2p::CONDUIT_ALPN;
@@ -21,12 +22,13 @@ struct MockStore {
     chunks: HashMap<u32, Vec<u8>>,
     encrypted_hash: [u8; 32],
     chunk_size: u32,
-    /// Track invoices so we can verify payment.
+    tree: MerkleTree,
     pending_preimage: Mutex<Option<[u8; 32]>>,
 }
 
 impl MockStore {
     fn new(encrypted_hash: [u8; 32], chunks: Vec<Vec<u8>>) -> Self {
+        let tree = MerkleTree::from_chunks(&chunks);
         let map: HashMap<u32, Vec<u8>> = chunks
             .into_iter()
             .enumerate()
@@ -36,6 +38,7 @@ impl MockStore {
             chunk_size: 256,
             encrypted_hash,
             chunks: map,
+            tree,
             pending_preimage: Mutex::new(None),
         }
     }
@@ -54,10 +57,17 @@ impl ChunkStore for MockStore {
             return None;
         }
         if self.chunks.contains_key(&index) {
-            Some(vec![ProofNode {
-                hash: [0xAB; 32],
-                is_left: true,
-            }])
+            let proof = self.tree.proof(index as usize);
+            Some(
+                proof
+                    .siblings
+                    .iter()
+                    .map(|(h, is_left)| ProofNode {
+                        hash: *h,
+                        is_left: *is_left,
+                    })
+                    .collect(),
+            )
         } else {
             None
         }
@@ -73,7 +83,7 @@ impl ChunkStore for MockStore {
         Some(Bitfield::from_bools(
             &available,
             self.chunk_size,
-            [0xCC; 32],
+            self.tree.root(),
         ))
     }
 
@@ -146,7 +156,7 @@ async fn full_download_flow() {
         conduit_p2p::client::BuyerClient::new(buyer_ep.clone(), "mock_ln_pubkey".to_string());
 
     let result = client
-        .download(seeder_addr, encrypted_hash, &[0, 1, 2], Arc::new(MockPayment))
+        .download(seeder_addr, encrypted_hash, &[0, 1, 2], Arc::new(MockPayment), None)
         .await
         .expect("download should succeed");
 
@@ -190,7 +200,7 @@ async fn partial_chunk_request() {
 
     // Only request chunks 1 and 3
     let result = client
-        .download(seeder_addr, encrypted_hash, &[1, 3], Arc::new(MockPayment))
+        .download(seeder_addr, encrypted_hash, &[1, 3], Arc::new(MockPayment), None)
         .await
         .expect("download should succeed");
 
@@ -248,7 +258,7 @@ fn cross_runtime_download() {
 
     rt_a_handle.spawn(async move {
         let result = client
-            .download(seeder_addr, encrypted_hash, &[0, 1], Arc::new(MockPayment))
+            .download(seeder_addr, encrypted_hash, &[0, 1], Arc::new(MockPayment), None)
             .await;
         let _ = tx.send(result);
     });
@@ -312,7 +322,7 @@ fn cross_runtime_blocking_payment() {
     let start = std::time::Instant::now();
     rt_a_handle.spawn(async move {
         let result = client
-            .download(seeder_addr, encrypted_hash, &[0], Arc::new(SlowMockPayment))
+            .download(seeder_addr, encrypted_hash, &[0], Arc::new(SlowMockPayment), None)
             .await;
         let _ = tx.send(result);
     });
