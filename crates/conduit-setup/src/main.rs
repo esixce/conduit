@@ -2723,6 +2723,7 @@ struct ConduitChunkStore {
     catalog: Arc<std::sync::Mutex<Vec<CatalogEntry>>>,
     node: Arc<Node>,
     emitter: Arc<ConsoleEmitter>,
+    event_router: Arc<EventRouter>,
     /// Active transport keys: encrypted_hash -> K_S bytes.
     /// When a buyer pays the invoice, the preimage (= K_S) is revealed.
     pending_keys: Arc<std::sync::Mutex<std::collections::HashMap<[u8; 32], [u8; 32]>>>,
@@ -2740,6 +2741,7 @@ impl ConduitChunkStore {
             catalog: state.catalog.clone(),
             node: state.node.clone(),
             emitter: state.emitter.clone(),
+            event_router: state.event_router.clone(),
             pending_keys: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
@@ -2851,6 +2853,56 @@ impl conduit_p2p::handler::ChunkStore for ConduitChunkStore {
             .lock()
             .unwrap()
             .insert(*encrypted_hash, ks);
+
+        let payment_hash = PaymentHash(invoice::payment_hash_for_key(&ks));
+        let rx = self.event_router.register(payment_hash);
+        let node = self.node.clone();
+        let router = self.event_router.clone();
+        let emitter = self.emitter.clone();
+        let eh = *encrypted_hash;
+        std::thread::spawn(move || {
+            eprintln!("[P2P-CLAIM] waiting for PaymentClaimable for transport invoice hash={}", hex::encode(payment_hash.0));
+            loop {
+                match rx.recv_timeout(std::time::Duration::from_secs(120)) {
+                    Ok(Event::PaymentClaimable {
+                        claimable_amount_msat,
+                        payment_hash: ph,
+                        ..
+                    }) if ph == payment_hash => {
+                        eprintln!("[P2P-CLAIM] PaymentClaimable received, claiming {}msat", claimable_amount_msat);
+                        match invoice::claim_payment(&node, &ks, claimable_amount_msat) {
+                            Ok(()) => {
+                                eprintln!("[P2P-CLAIM] payment claimed successfully");
+                                emitter.emit(
+                                    "seeder",
+                                    "P2P_TRANSPORT_CLAIMED",
+                                    serde_json::json!({
+                                        "encrypted_hash": hex::encode(eh),
+                                        "amount_msat": claimable_amount_msat,
+                                    }),
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!("[P2P-CLAIM] claim_payment failed: {e}");
+                            }
+                        }
+                        router.unregister(&payment_hash);
+                        break;
+                    }
+                    Ok(_other) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        eprintln!("[P2P-CLAIM] timed out waiting for transport payment (120s)");
+                        router.unregister(&payment_hash);
+                        break;
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        eprintln!("[P2P-CLAIM] event router channel disconnected");
+                        break;
+                    }
+                }
+            }
+        });
+
         self.emitter.emit(
             "seeder",
             "P2P_INVOICE_CREATED",
