@@ -29,3 +29,4 @@ rusqlite = "0.31"
 p256 = { version = "0.13", features = ["ecdsa"] }
 conduit-p2p = { path = "../conduit-p2p" }
 anyhow = "1"
+tracing-subscriber = "0.3"

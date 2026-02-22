@@ -2989,11 +2989,19 @@ async fn p2p_test_handler(
     let remote_node_id = info_resp["node_id"].as_str().unwrap_or("").to_string();
     let direct_addrs: Vec<String> = info_resp["direct_addrs"]
         .as_array()
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
     let relay_urls: Vec<String> = info_resp["relay_urls"]
         .as_array()
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
 
     let addr = match remote_node_id.parse::<conduit_p2p::iroh::PublicKey>() {
@@ -3057,24 +3065,20 @@ async fn p2p_test_handler(
             }))
             .into_response()
         }
-        Ok(Err(_)) => {
-            Json(serde_json::json!({
-                "status": "timeout",
-                "remote_node_id": remote_node_id,
-                "direct_addrs": direct_addrs,
-                "relay_urls": relay_urls,
-                "elapsed_ms": 10000,
-                "error": "P2P connect timed out after 10s",
-            }))
-            .into_response()
-        }
-        Err(e) => {
-            Json(serde_json::json!({
-                "status": "runtime_error",
-                "error": format!("tokio join error: {e}"),
-            }))
-            .into_response()
-        }
+        Ok(Err(_)) => Json(serde_json::json!({
+            "status": "timeout",
+            "remote_node_id": remote_node_id,
+            "direct_addrs": direct_addrs,
+            "relay_urls": relay_urls,
+            "elapsed_ms": 10000,
+            "error": "P2P connect timed out after 10s",
+        }))
+        .into_response(),
+        Err(e) => Json(serde_json::json!({
+            "status": "runtime_error",
+            "error": format!("tokio join error: {e}"),
+        }))
+        .into_response(),
     }
 }
 
@@ -6567,18 +6571,35 @@ fn handle_buy_pre(
                                             }
                                         }
                                     }
-                                    let payment_handler = LdkPaymentHandler {
+                                    let payment_handler: std::sync::Arc<
+                                        dyn conduit_p2p::client::PaymentHandler,
+                                    > = std::sync::Arc::new(LdkPaymentHandler {
                                         node: Arc::clone(node),
                                         router: Arc::clone(router),
-                                    };
+                                    });
 
-                                    let p2p_rt = p2p_runtime_handle.as_ref().expect("P2P runtime handle must exist when p2p_node is Some");
-                                    match p2p_rt.block_on(buyer_client.download(
-                                        addr,
-                                        hash_bytes,
-                                        &indices,
-                                        &payment_handler,
-                                    )) {
+                                    let p2p_rt = p2p_runtime_handle.as_ref().expect(
+                                        "P2P runtime handle must exist when p2p_node is Some",
+                                    );
+                                    let (download_tx, download_rx) =
+                                        std::sync::mpsc::sync_channel::<
+                                            anyhow::Result<conduit_p2p::client::DownloadResult>,
+                                        >(1);
+                                    let indices_owned = indices.clone();
+                                    p2p_rt.spawn(async move {
+                                        let result = buyer_client
+                                            .download(
+                                                addr,
+                                                hash_bytes,
+                                                &indices_owned,
+                                                payment_handler,
+                                            )
+                                            .await;
+                                        let _ = download_tx.send(result);
+                                    });
+                                    match download_rx.recv().unwrap_or_else(|_| {
+                                        Err(anyhow::anyhow!("P2P download task dropped"))
+                                    }) {
                                         Ok(result) => {
                                             emitter.emit(
                                                 role,
@@ -6963,6 +6984,8 @@ enum Commands {
 // ---------------------------------------------------------------------------
 
 fn main() {
+    tracing_subscriber::fmt::init();
+
     let cli = Cli::parse();
 
     // Build chain source
