@@ -6779,23 +6779,60 @@ fn handle_buy_pre(
                                         ) -> anyhow::Result<[u8; 32]>
                                         {
                                             use ldk_node::lightning_invoice::Bolt11Invoice;
+                                            eprintln!("[LdkPaymentHandler] pay_invoice called, bolt11 len={}", bolt11.len());
+
                                             let inv: Bolt11Invoice = bolt11.parse()
                                                 .map_err(|e: ldk_node::lightning_invoice::ParseOrSemanticError| {
+                                                    eprintln!("[LdkPaymentHandler] bad bolt11 parse: {e}");
                                                     anyhow::anyhow!("bad bolt11: {e}")
                                                 })?;
+
+                                            let payee = inv.recover_payee_pub_key();
+                                            let amt = inv.amount_milli_satoshis().unwrap_or(0);
                                             let h: &[u8] = inv.payment_hash().as_ref();
                                             let mut hash = [0u8; 32];
                                             hash.copy_from_slice(h);
                                             let target = PaymentHash(hash);
 
+                                            eprintln!(
+                                                "[LdkPaymentHandler] invoice: payee={}, amt_msat={}, payment_hash={}",
+                                                payee, amt, hex::encode(hash)
+                                            );
+
+                                            let channels = self.node.list_channels();
+                                            let usable = channels.iter().filter(|c| c.is_usable).count();
+                                            let to_payee = channels.iter().find(|c| {
+                                                c.counterparty_node_id.to_string() == payee.to_string()
+                                            });
+                                            eprintln!(
+                                                "[LdkPaymentHandler] channels: total={}, usable={}, direct_to_payee={}",
+                                                channels.len(),
+                                                usable,
+                                                if let Some(ch) = &to_payee {
+                                                    format!("yes (outbound={}msat, usable={})", ch.outbound_capacity_msat, ch.is_usable)
+                                                } else {
+                                                    "no".to_string()
+                                                }
+                                            );
+
                                             let rx = self.router.register(target);
+                                            eprintln!("[LdkPaymentHandler] registered EventRouter listener for {}", hex::encode(hash));
 
-                                            let _payment_hash =
-                                                invoice::pay_invoice(&self.node, bolt11)
-                                                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                                            eprintln!("[LdkPaymentHandler] calling invoice::pay_invoice...");
+                                            let pay_start = std::time::Instant::now();
+                                            let pay_result = invoice::pay_invoice(&self.node, bolt11)
+                                                .map_err(|e| {
+                                                    eprintln!("[LdkPaymentHandler] pay_invoice FAILED after {}ms: {e}", pay_start.elapsed().as_millis());
+                                                    self.router.unregister(&target);
+                                                    anyhow::anyhow!("{e}")
+                                                });
+                                            let _payment_hash = pay_result?;
+                                            eprintln!("[LdkPaymentHandler] pay_invoice sent in {}ms, waiting for event...", pay_start.elapsed().as_millis());
 
+                                            let wait_start = std::time::Instant::now();
                                             loop {
                                                 let event = rx.recv().map_err(|_| {
+                                                    eprintln!("[LdkPaymentHandler] event router channel dropped after {}ms", wait_start.elapsed().as_millis());
                                                     anyhow::anyhow!("event router dropped")
                                                 })?;
                                                 match event {
@@ -6803,17 +6840,31 @@ fn handle_buy_pre(
                                                         payment_preimage: Some(pre),
                                                         ..
                                                     } => {
+                                                        eprintln!(
+                                                            "[LdkPaymentHandler] PaymentSuccessful with preimage in {}ms",
+                                                            wait_start.elapsed().as_millis()
+                                                        );
                                                         self.router.unregister(&target);
                                                         return Ok(pre.0);
                                                     }
                                                     Event::PaymentFailed { reason, .. } => {
+                                                        eprintln!(
+                                                            "[LdkPaymentHandler] PaymentFailed after {}ms: {:?}",
+                                                            wait_start.elapsed().as_millis(), reason
+                                                        );
                                                         self.router.unregister(&target);
                                                         return Err(anyhow::anyhow!(
                                                             "P2P chunk payment failed: {:?}",
                                                             reason
                                                         ));
                                                     }
-                                                    _ => {}
+                                                    other => {
+                                                        eprintln!(
+                                                            "[LdkPaymentHandler] ignoring event {:?} after {}ms",
+                                                            std::mem::discriminant(&other),
+                                                            wait_start.elapsed().as_millis()
+                                                        );
+                                                    }
                                                 }
                                             }
                                         }
@@ -6833,7 +6884,11 @@ fn handle_buy_pre(
                                             anyhow::Result<conduit_p2p::client::DownloadResult>,
                                         >(1);
                                     let indices_owned = indices.clone();
+                                    let num_indices = indices_owned.len();
+                                    eprintln!("[P2P-BUY] spawning download: {} chunks, hash={}", num_indices, hex::encode(hash_bytes));
+                                    let dl_start = std::time::Instant::now();
                                     p2p_rt.spawn(async move {
+                                        eprintln!("[P2P-BUY] download task started on P2P runtime");
                                         let result = buyer_client
                                             .download(
                                                 addr,
@@ -6842,9 +6897,14 @@ fn handle_buy_pre(
                                                 payment_handler,
                                             )
                                             .await;
+                                        match &result {
+                                            Ok(r) => eprintln!("[P2P-BUY] download completed: {} chunks, {}msat", r.chunks.len(), r.total_paid_msat),
+                                            Err(e) => eprintln!("[P2P-BUY] download failed: {e:#}"),
+                                        }
                                         let _ = download_tx.send(result);
                                     });
                                     match download_rx.recv().unwrap_or_else(|_| {
+                                        eprintln!("[P2P-BUY] download channel dropped after {}ms", dl_start.elapsed().as_millis());
                                         Err(anyhow::anyhow!("P2P download task dropped"))
                                     }) {
                                         Ok(result) => {
