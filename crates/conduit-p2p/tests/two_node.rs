@@ -146,7 +146,7 @@ async fn full_download_flow() {
         conduit_p2p::client::BuyerClient::new(buyer_ep.clone(), "mock_ln_pubkey".to_string());
 
     let result = client
-        .download(seeder_addr, encrypted_hash, &[0, 1, 2], &MockPayment)
+        .download(seeder_addr, encrypted_hash, &[0, 1, 2], Arc::new(MockPayment))
         .await
         .expect("download should succeed");
 
@@ -190,7 +190,7 @@ async fn partial_chunk_request() {
 
     // Only request chunks 1 and 3
     let result = client
-        .download(seeder_addr, encrypted_hash, &[1, 3], &MockPayment)
+        .download(seeder_addr, encrypted_hash, &[1, 3], Arc::new(MockPayment))
         .await
         .expect("download should succeed");
 
@@ -203,6 +203,133 @@ async fn partial_chunk_request() {
 
     buyer_ep.close().await;
     router.shutdown().await.expect("router shutdown");
+}
+
+// ── Layer 2: Cross-runtime tests ─────────────────────────────────────
+// These reproduce the production architecture where the seeder's iroh
+// endpoint lives on Runtime A and the buyer drives the download from
+// Runtime B via handle.spawn() + sync channel.
+
+#[test]
+fn cross_runtime_download() {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let encrypted_hash = [0x03; 32];
+    let chunk_data: Vec<Vec<u8>> = vec![
+        b"cross-runtime-chunk-0".to_vec(),
+        b"cross-runtime-chunk-1".to_vec(),
+    ];
+    let store = Arc::new(MockStore::new(encrypted_hash, chunk_data.clone()));
+
+    // Runtime A: seeder + buyer iroh endpoints live here
+    let rt_a = tokio::runtime::Runtime::new().expect("runtime A");
+    let rt_a_handle = rt_a.handle().clone();
+
+    let (seeder_addr, buyer_ep, router) = rt_a.block_on(async {
+        let seeder_ep = make_endpoint(vec![CONDUIT_ALPN.to_vec()]).await;
+        let handler = Arc::new(ChunkProtocol::new(store));
+        let router = Router::builder(seeder_ep.clone())
+            .accept(CONDUIT_ALPN, handler.as_ref().clone())
+            .spawn();
+        let addr = seeder_ep.addr();
+        let buyer_ep = make_endpoint(vec![]).await;
+        (addr, buyer_ep, router)
+    });
+
+    // Keep Runtime A alive in a background thread (like production)
+    std::thread::spawn(move || {
+        rt_a.block_on(std::future::pending::<()>());
+    });
+
+    // Drive the download from here (a bare OS thread, not in any runtime)
+    // using handle.spawn() + sync channel -- exactly like handle_buy_pre
+    let (tx, rx) = std::sync::mpsc::sync_channel::<anyhow::Result<conduit_p2p::client::DownloadResult>>(1);
+    let client = conduit_p2p::client::BuyerClient::new(buyer_ep.clone(), "cross_rt_ln".to_string());
+
+    rt_a_handle.spawn(async move {
+        let result = client
+            .download(seeder_addr, encrypted_hash, &[0, 1], Arc::new(MockPayment))
+            .await;
+        let _ = tx.send(result);
+    });
+
+    let result = rx
+        .recv_timeout(std::time::Duration::from_secs(15))
+        .expect("download timed out (recv)")
+        .expect("download failed");
+
+    assert_eq!(result.chunks.len(), 2);
+    let by_index: HashMap<u32, Vec<u8>> = result.chunks.into_iter().collect();
+    assert_eq!(by_index[&0], b"cross-runtime-chunk-0");
+    assert_eq!(by_index[&1], b"cross-runtime-chunk-1");
+
+    rt_a_handle.spawn(async move {
+        buyer_ep.close().await;
+        router.shutdown().await.expect("router shutdown");
+    });
+}
+
+// ── Layer 2b: Blocking payment inside spawn_blocking ─────────────────
+
+struct SlowMockPayment;
+
+impl conduit_p2p::client::PaymentHandler for SlowMockPayment {
+    fn pay_invoice(&self, _bolt11: &str) -> anyhow::Result<[u8; 32]> {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        Ok([0x42; 32])
+    }
+}
+
+#[test]
+fn cross_runtime_blocking_payment() {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let encrypted_hash = [0x04; 32];
+    let chunk_data: Vec<Vec<u8>> = vec![b"blocking-pay-chunk".to_vec()];
+    let store = Arc::new(MockStore::new(encrypted_hash, chunk_data.clone()));
+
+    let rt_a = tokio::runtime::Runtime::new().expect("runtime A");
+    let rt_a_handle = rt_a.handle().clone();
+
+    let (seeder_addr, buyer_ep, router) = rt_a.block_on(async {
+        let seeder_ep = make_endpoint(vec![CONDUIT_ALPN.to_vec()]).await;
+        let handler = Arc::new(ChunkProtocol::new(store));
+        let router = Router::builder(seeder_ep.clone())
+            .accept(CONDUIT_ALPN, handler.as_ref().clone())
+            .spawn();
+        let addr = seeder_ep.addr();
+        let buyer_ep = make_endpoint(vec![]).await;
+        (addr, buyer_ep, router)
+    });
+
+    std::thread::spawn(move || {
+        rt_a.block_on(std::future::pending::<()>());
+    });
+
+    let (tx, rx) = std::sync::mpsc::sync_channel::<anyhow::Result<conduit_p2p::client::DownloadResult>>(1);
+    let client = conduit_p2p::client::BuyerClient::new(buyer_ep.clone(), "slow_pay_ln".to_string());
+
+    let start = std::time::Instant::now();
+    rt_a_handle.spawn(async move {
+        let result = client
+            .download(seeder_addr, encrypted_hash, &[0], Arc::new(SlowMockPayment))
+            .await;
+        let _ = tx.send(result);
+    });
+
+    let result = rx
+        .recv_timeout(std::time::Duration::from_secs(15))
+        .expect("download timed out (recv)")
+        .expect("download failed with blocking payment");
+
+    let elapsed = start.elapsed();
+    assert!(elapsed.as_millis() >= 450, "payment should have blocked ~500ms");
+    assert_eq!(result.chunks.len(), 1);
+
+    rt_a_handle.spawn(async move {
+        buyer_ep.close().await;
+        router.shutdown().await.expect("router shutdown");
+    });
 }
 
 #[tokio::test]

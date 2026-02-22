@@ -3082,6 +3082,252 @@ async fn p2p_test_handler(
     }
 }
 
+/// GET /api/p2p-test-download?target=http://host:port&hash=<encrypted_hash>
+///
+/// Runs the full Conduit chunk protocol (Handshake -> Bitfield -> Request ->
+/// Invoice -> PaymentProof -> Chunks) over live iroh QUIC with a mock payment.
+/// The seeder will reject at verify_payment (PaymentRequired) -- that is the
+/// expected success case proving transport works end-to-end.
+async fn p2p_test_download_handler(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    use axum::Json;
+
+    let target = match params.get("target") {
+        Some(t) => t.clone(),
+        None => {
+            return Json(serde_json::json!({"error": "missing ?target= parameter"}))
+                .into_response()
+        }
+    };
+    let hash_hex = match params.get("hash") {
+        Some(h) => h.clone(),
+        None => {
+            return Json(serde_json::json!({"error": "missing ?hash= parameter"}))
+                .into_response()
+        }
+    };
+
+    let p2p = match &state.p2p_node {
+        Some(p) => p.clone(),
+        None => {
+            return Json(serde_json::json!({"error": "P2P not enabled on this node"}))
+                .into_response()
+        }
+    };
+    let p2p_rt = match &state.p2p_runtime_handle {
+        Some(h) => h.clone(),
+        None => {
+            return Json(serde_json::json!({"error": "P2P runtime handle not available"}))
+                .into_response()
+        }
+    };
+
+    let info_url = format!("{}/api/p2p-info", target.trim_end_matches('/'));
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return Json(serde_json::json!({"error": format!("http client: {e}")}))
+                .into_response()
+        }
+    };
+
+    let info_resp = match client.get(&info_url).send().await {
+        Ok(r) => match r.json::<serde_json::Value>().await {
+            Ok(v) => v,
+            Err(e) => {
+                return Json(serde_json::json!({"error": format!("p2p-info parse: {e}")}))
+                    .into_response()
+            }
+        },
+        Err(e) => {
+            return Json(serde_json::json!({"error": format!("fetch {info_url}: {e}")}))
+                .into_response()
+        }
+    };
+
+    if info_resp["enabled"].as_bool() != Some(true) {
+        return Json(serde_json::json!({"error": "target P2P not enabled", "info": info_resp}))
+            .into_response();
+    }
+
+    let remote_node_id = info_resp["node_id"].as_str().unwrap_or("").to_string();
+    let direct_addrs: Vec<String> = info_resp["direct_addrs"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let relay_urls: Vec<String> = info_resp["relay_urls"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let addr = match remote_node_id.parse::<conduit_p2p::iroh::PublicKey>() {
+        Ok(pk) => {
+            let mut a = conduit_p2p::iroh::EndpointAddr::from(pk);
+            for s in &direct_addrs {
+                if let Ok(sa) = s.parse::<std::net::SocketAddr>() {
+                    a = a.with_ip_addr(sa);
+                }
+            }
+            for u in &relay_urls {
+                if let Ok(ru) = u.parse::<conduit_p2p::iroh::RelayUrl>() {
+                    a = a.with_relay_url(ru);
+                }
+            }
+            a
+        }
+        Err(e) => {
+            return Json(serde_json::json!({"error": format!("parse node id: {e}")}))
+                .into_response()
+        }
+    };
+
+    let enc_hash_bytes: [u8; 32] = match hex::decode(&hash_hex) {
+        Ok(b) if b.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        _ => {
+            return Json(serde_json::json!({"error": "hash must be 64 hex chars (32 bytes)"}))
+                .into_response()
+        }
+    };
+
+    struct TestPayment;
+    impl conduit_p2p::client::PaymentHandler for TestPayment {
+        fn pay_invoice(&self, _bolt11: &str) -> anyhow::Result<[u8; 32]> {
+            Ok([0u8; 32])
+        }
+    }
+
+    let ep = p2p.endpoint().clone();
+    let ln_pk = state.node.node_id().to_string();
+    let buyer_client = conduit_p2p::client::BuyerClient::new(ep, ln_pk);
+
+    let catalog_url = format!("{}/api/catalog", target.trim_end_matches('/'));
+    let num_chunks: u32 = match client.get(&catalog_url).send().await {
+        Ok(resp) => match resp.json::<serde_json::Value>().await {
+            Ok(cat) => {
+                let items = cat.as_array().or_else(|| cat["items"].as_array());
+                items
+                    .and_then(|arr| {
+                        let entry = arr.iter().find(|e| {
+                            e["encrypted_hash"].as_str() == Some(hash_hex.as_str())
+                                || e["content_hash"].as_str() == Some(hash_hex.as_str())
+                        })?;
+                        entry["chunk_count"]
+                            .as_u64()
+                            .or_else(|| entry["total_chunks"].as_u64())
+                    })
+                    .unwrap_or(1) as u32
+            }
+            Err(_) => 1,
+        },
+        Err(_) => 1,
+    };
+
+    let indices: Vec<u32> = (0..num_chunks).collect();
+    let payment: std::sync::Arc<dyn conduit_p2p::client::PaymentHandler> =
+        std::sync::Arc::new(TestPayment);
+
+    let start = std::time::Instant::now();
+
+    let (tx, rx) =
+        std::sync::mpsc::sync_channel::<anyhow::Result<conduit_p2p::client::DownloadResult>>(1);
+    let indices_owned = indices.clone();
+    p2p_rt.spawn(async move {
+        let result = buyer_client
+            .download(addr, enc_hash_bytes, &indices_owned, payment)
+            .await;
+        let _ = tx.send(result);
+    });
+
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        tokio::task::spawn_blocking(move || rx.recv()),
+    )
+    .await;
+
+    let elapsed = start.elapsed();
+
+    match outcome {
+        Ok(Ok(Ok(Ok(result)))) => Json(serde_json::json!({
+            "status": "download_complete",
+            "chunks_received": result.chunks.len(),
+            "total_paid_msat": result.total_paid_msat,
+            "elapsed_ms": elapsed.as_millis(),
+            "message": "Full protocol succeeded (mock payment accepted by seeder)",
+        }))
+        .into_response(),
+        Ok(Ok(Ok(Err(e)))) => {
+            let err_str = format!("{e:#}");
+            let step = if err_str.contains("connect") || err_str.contains("timed out") {
+                "connect"
+            } else if err_str.contains("Bitfield") || err_str.contains("Handshake") {
+                "handshake"
+            } else if err_str.contains("Invoice") {
+                "request"
+            } else if err_str.contains("PaymentRequired") {
+                "payment_verification"
+            } else if err_str.contains("paying invoice") {
+                "payment"
+            } else if err_str.contains("chunk") {
+                "chunk_transfer"
+            } else {
+                "unknown"
+            };
+            Json(serde_json::json!({
+                "status": "protocol_error",
+                "failed_at_step": step,
+                "error": err_str,
+                "elapsed_ms": elapsed.as_millis(),
+                "remote_node_id": remote_node_id,
+                "direct_addrs": direct_addrs,
+                "relay_urls": relay_urls,
+                "num_chunks_requested": num_chunks,
+                "message": if step == "payment_verification" {
+                    "Transport works! Seeder correctly rejected mock preimage. Problem is isolated to real Lightning payment."
+                } else {
+                    "Transport failed at the indicated step."
+                },
+            }))
+            .into_response()
+        }
+        Ok(Ok(Err(e))) => Json(serde_json::json!({
+            "status": "channel_error",
+            "error": format!("recv error: {e}"),
+            "elapsed_ms": elapsed.as_millis(),
+        }))
+        .into_response(),
+        Ok(Err(e)) => Json(serde_json::json!({
+            "status": "join_error",
+            "error": format!("{e}"),
+            "elapsed_ms": elapsed.as_millis(),
+        }))
+        .into_response(),
+        Err(_) => Json(serde_json::json!({
+            "status": "timeout",
+            "error": "P2P test download timed out after 30s",
+            "elapsed_ms": elapsed.as_millis(),
+        }))
+        .into_response(),
+    }
+}
+
 fn start_http_server(port: u16, state: AppState) {
     thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
@@ -3179,6 +3425,7 @@ fn start_http_server(port: u16, state: AppState) {
                 // P2P info and diagnostics
                 .route("/api/p2p-info", get(p2p_info_handler))
                 .route("/api/p2p-test", get(p2p_test_handler))
+                .route("/api/p2p-test-download", get(p2p_test_download_handler))
                 .layer(CorsLayer::permissive())
                 .with_state(state);
             let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port))

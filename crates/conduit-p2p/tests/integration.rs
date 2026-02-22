@@ -74,7 +74,7 @@ impl conduit_p2p::client::PaymentHandler for MockPayment {
 
 #[tokio::test]
 async fn test_full_download_flow() {
-    tracing_subscriber::fmt::init();
+    let _ = tracing_subscriber::fmt::try_init();
 
     let store = Arc::new(MockStore);
     let handler = Arc::new(ChunkProtocol::new(store));
@@ -104,7 +104,7 @@ async fn test_full_download_flow() {
     );
 
     let result = client
-        .download(seeder_addr, TEST_ENCRYPTED_HASH, &[0, 1, 2], &MockPayment)
+        .download(seeder_addr, TEST_ENCRYPTED_HASH, &[0, 1, 2], Arc::new(MockPayment))
         .await
         .expect("download failed");
 
