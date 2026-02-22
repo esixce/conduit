@@ -183,6 +183,9 @@ pub struct CatalogEntry {
     // --- TEE playback policy ---
     #[serde(default = "default_playback_policy")]
     pub playback_policy: String, // "open" | "device_recommended" | "device_required"
+    // --- Layer 2: creator-signed listings ---
+    #[serde(default)]
+    pub creator_signature: String, // Lightning ECDSA signature (zbase32), empty for seeder entries
 }
 
 pub fn default_playback_policy() -> String {

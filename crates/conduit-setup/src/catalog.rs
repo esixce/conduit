@@ -258,6 +258,7 @@ pub fn resync_stale_seeds(
             pre_c2_hex: String::new(),
             pre_pk_creator_hex: String::new(),
             playback_policy: "open".to_string(),
+            creator_signature: String::new(),
         };
 
         {

@@ -309,12 +309,14 @@ pub async fn register_api_handler(
     State(state): State<AppState>,
     Json(req): Json<RegisterRequest>,
 ) -> Json<serde_json::Value> {
+    let node = state.node.clone();
     let tx = state.emitter.clone();
     let catalog = state.catalog.clone();
     let storage_dir = state.storage_dir.clone();
     let registry_info = state.registry_info.clone();
     thread::spawn(move || {
         handle_register(
+            &node,
             tx.as_ref(),
             &storage_dir,
             &catalog,
