@@ -1,0 +1,53 @@
+---
+description: Conduit deployment process — how to build and deploy all nodes
+alwaysApply: true
+---
+
+# Conduit Deployment
+
+## How to Deploy
+
+**NEVER manually SCP binaries or SSH to restart services.** All deployments go through GitHub Actions.
+
+1. Commit changes to `conduit/` repo
+2. Push to `main` branch
+3. The `.github/workflows/deploy.yml` workflow automatically:
+   - Builds `conduit-setup` release binary on Ubuntu
+   - Deploys to ALL nodes in parallel (stop → upload binary + service file → start)
+4. Monitor the run at `gh run list --workflow=deploy.yml` or the GitHub Actions UI
+
+## Node Inventory
+
+| Node | Host Secret | IP | Service Name | Binary Path | User |
+|------|------------|-----|-------------|-------------|------|
+| Creator | `CREATOR_HOST` | `167.172.152.231` | `conduit-creator` | `/root/conduit/target/release/conduit-setup` | `root` |
+| Buyer | `BUYER_HOST` | `192.34.58.149` | `conduit-buyer` | `/root/conduit/target/release/conduit-setup` | `root` |
+| Seeder 1 (AWS) | `SEEDER_HOST` | `54.89.56.74` | `conduit-seeder` | `/home/ubuntu/conduit/target/release/conduit-setup` | `ubuntu` |
+| Seeder 2 | `REGISTRY_HOST` | `157.230.238.79` | `conduit-seeder2` | `/root/conduit/target/release/conduit-setup` | `root` |
+| Advertiser | `ADVERTISER_HOST` | `104.248.57.152` | `conduit-node` | `/root/conduit/target/release/conduit-setup` | `root` |
+| DsgnDude | `DSGNDUDE_HOST` | `147.182.138.182` | `conduit-node` | `/root/conduit/target/release/conduit-setup` | `root` |
+| Peer7 | `PEER7_HOST` | `68.183.27.110` | `conduit-node` | `/root/conduit/target/release/conduit-setup` | `root` |
+| Peer8 | `PEER8_HOST` | `159.223.168.79` | `conduit-node` | `/root/conduit/target/release/conduit-setup` | `root` |
+
+## Service Files
+
+Service files live in `conduit/deploy/*.service`. The deploy workflow uploads these alongside the binary. To change a node's runtime flags (e.g. `--p2p`, ports), edit the corresponding `.service` file and push.
+
+## SSH Keys
+
+- DigitalOcean nodes use `DEPLOY_SSH_KEY`
+- AWS Seeder uses `SEEDER_SSH_KEY`
+
+## Checking Deploy Status
+
+```bash
+# From the conduit/ directory:
+gh run list --workflow=deploy.yml -L 5
+gh run view <run-id>
+```
+
+## Checking Node Logs After Deploy
+
+```bash
+ssh root@<IP> 'journalctl -u <service-name> --no-pager -n 30'
+```

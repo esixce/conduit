@@ -17,7 +17,7 @@ pub struct DownloadResult {
 }
 
 /// Trait the buyer's application implements for Lightning payments.
-pub trait PaymentHandler: Send + Sync {
+pub trait PaymentHandler: Send + Sync + 'static {
     /// Pay a BOLT11 invoice. Returns the preimage on success.
     fn pay_invoice(&self, bolt11: &str) -> Result<[u8; 32]>;
 }
@@ -48,7 +48,7 @@ impl BuyerClient {
         seeder_addr: EndpointAddr,
         encrypted_hash: [u8; 32],
         desired_indices: &[u32],
-        payment: &dyn PaymentHandler,
+        payment: std::sync::Arc<dyn PaymentHandler>,
     ) -> Result<DownloadResult> {
         let conn = tokio::time::timeout(
             std::time::Duration::from_secs(15),
@@ -69,7 +69,7 @@ impl BuyerClient {
         conn: Connection,
         encrypted_hash: [u8; 32],
         desired_indices: &[u32],
-        payment: &dyn PaymentHandler,
+        payment: std::sync::Arc<dyn PaymentHandler>,
     ) -> Result<DownloadResult> {
         let (mut send, mut recv) = conn.open_bi().await?;
 
@@ -136,9 +136,13 @@ impl BuyerClient {
             "received invoice, paying"
         );
 
-        let preimage = payment
-            .pay_invoice(&invoice.bolt11)
-            .context("paying invoice")?;
+        let bolt11_owned = invoice.bolt11.clone();
+        let payment_clone = payment.clone();
+        let preimage =
+            tokio::task::spawn_blocking(move || payment_clone.pay_invoice(&bolt11_owned))
+                .await
+                .map_err(|e| anyhow::anyhow!("spawn_blocking join error: {e}"))?
+                .context("paying invoice")?;
 
         write_msg(&mut send, &Message::PaymentProof(PaymentProof { preimage })).await?;
 
@@ -146,7 +150,16 @@ impl BuyerClient {
         let mut received = 0u32;
 
         while received < invoice.chunk_count {
-            match read_msg(&mut recv).await? {
+            let msg = tokio::time::timeout(std::time::Duration::from_secs(30), read_msg(&mut recv))
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "timed out waiting for chunk {}/{}",
+                        received + 1,
+                        invoice.chunk_count
+                    )
+                })?;
+            match msg? {
                 Message::Chunk(chunk) => {
                     debug!(
                         index = chunk.chunk_index,

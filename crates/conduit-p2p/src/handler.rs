@@ -204,14 +204,20 @@ impl ChunkProtocol {
                     };
 
                     for &idx in &indices {
-                        let data = match self.store.get_chunk(&encrypted_hash, idx) {
-                            Some(d) => d,
+                        let store = self.store.clone();
+                        let hash = encrypted_hash;
+                        let chunk_result = tokio::task::spawn_blocking(move || {
+                            let data = store.get_chunk(&hash, idx);
+                            let proof = store.get_proof(&hash, idx).unwrap_or_default();
+                            data.map(|d| (d, proof))
+                        })
+                        .await
+                        .context("spawn_blocking for chunk read")?;
+
+                        let (data, proof_nodes) = match chunk_result {
+                            Some(pair) => pair,
                             None => continue,
                         };
-                        let proof_nodes = self
-                            .store
-                            .get_proof(&encrypted_hash, idx)
-                            .unwrap_or_default();
 
                         write_msg(
                             &mut send,
