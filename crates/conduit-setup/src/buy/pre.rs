@@ -12,6 +12,7 @@ use ldk_node::{Event, Node};
 use ldk_node::payment::{PaymentDirection, PaymentKind, PaymentStatus};
 
 use crate::events::*;
+use crate::sell::listing_canonical_message;
 
 /// Helper macro: emit BUY_ERROR and return early on failure.
 macro_rules! pre_bail {
@@ -31,7 +32,7 @@ pub fn handle_buy_pre(
     node: &Arc<Node>,
     emitter: &ConsoleEmitter,
     router: &Arc<EventRouter>,
-    _storage_dir: &str,
+    storage_dir: &str,
     buyer_kp: &pre::BuyerKeyPair,
     creator_url: &str,
     content_hash: &str,
@@ -124,6 +125,53 @@ pub fn handle_buy_pre(
         None
     };
 
+    // Layer 2: verify creator signature on the listing before trusting encrypted_root
+    let creator_sig = purchase_resp["creator_signature"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    let creator_pubkey = purchase_resp["creator_pubkey"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    if !creator_sig.is_empty() && !creator_pubkey.is_empty() {
+        let canonical = listing_canonical_message(
+            content_hash,
+            &enc_hash,
+            &encrypted_root_hex,
+            price_sats,
+            &creator_pubkey,
+        );
+        let pk = match creator_pubkey
+            .parse::<ldk_node::bitcoin::secp256k1::PublicKey>()
+        {
+            Ok(pk) => pk,
+            Err(e) => pre_bail!(emitter, format!("Invalid creator_pubkey: {}", e)),
+        };
+        if !node.verify_signature(canonical.as_bytes(), &creator_sig, &pk) {
+            pre_bail!(
+                emitter,
+                "Creator signature verification FAILED — listing may be forged. Aborting purchase."
+            );
+        }
+        emitter.emit(
+            role,
+            "CREATOR_SIG_VERIFIED",
+            serde_json::json!({
+                "creator_pubkey": &creator_pubkey,
+                "message": "Creator listing signature verified (Layer 2)",
+            }),
+        );
+    } else {
+        emitter.emit(
+            role,
+            "CREATOR_SIG_MISSING",
+            serde_json::json!({
+                "message": "No creator signature in listing response — skipping verification (legacy listing)",
+            }),
+        );
+    }
+
     emitter.emit(
         role,
         "PRE_PURCHASE_RECEIVED",
@@ -171,6 +219,8 @@ pub fn handle_buy_pre(
         serde_json::json!({ "bolt11": &bolt11 }),
     );
 
+    let mut preimage_hex = String::new();
+
     let hash_bytes = match invoice::pay_invoice_with_retry(node, &bolt11, 3, Duration::from_secs(3))
     {
         Ok(h) => h,
@@ -206,7 +256,8 @@ pub fn handle_buy_pre(
                 }
 
                 match found_preimage {
-                    Some(_preimage) => {
+                    Some(recovered_preimage) => {
+                        preimage_hex = hex::encode(recovered_preimage);
                         emitter.emit(
                             role,
                             "PRE_PAYMENT_CONFIRMED",
@@ -281,12 +332,13 @@ pub fn handle_buy_pre(
                 fee_paid_msat,
                 ..
             } => {
+                preimage_hex = hex::encode(preimage.0);
                 emitter.emit(
                     role,
                     "PRE_PAYMENT_CONFIRMED",
                     serde_json::json!({
                         "payment_hash": hex::encode(payment_hash.0),
-                        "preimage": hex::encode(preimage.0),
+                        "preimage": &preimage_hex,
                         "fee_msat": fee_paid_msat,
                         "message": "PRE payment confirmed.",
                     }),
@@ -313,6 +365,58 @@ pub fn handle_buy_pre(
         }
     }
     router.unregister(&target_hash);
+
+    // -- Persist purchase receipt (the exchange IS the receipt) --
+    {
+        let receipts_dir = std::path::Path::new(storage_dir).join("receipts");
+        if let Err(e) = std::fs::create_dir_all(&receipts_dir) {
+            eprintln!("[buy-pre] failed to create receipts dir: {e}");
+        } else {
+            let buyer_ln_pubkey = invoice::node_id(node);
+            let file_name = purchase_resp["file_name"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let receipt = serde_json::json!({
+                "version": 1,
+                "content_hash": content_hash,
+                "encrypted_hash": &enc_hash,
+                "encrypted_root": &encrypted_root_hex,
+                "buyer_pk_hex": &buyer_pk_hex,
+                "buyer_ln_pubkey": buyer_ln_pubkey,
+                "creator_pubkey": &creator_pubkey,
+                "creator_signature": &creator_sig,
+                "bolt11": &bolt11,
+                "payment_hash": hex::encode(pre_payment_hash),
+                "preimage": &preimage_hex,
+                "rk_compressed_hex": &rk_compressed_hex,
+                "price_sats": price_sats,
+                "file_name": &file_name,
+                "timestamp": timestamp,
+            });
+            let receipt_path = receipts_dir.join(format!("{}.json", content_hash));
+            match std::fs::write(&receipt_path, serde_json::to_string_pretty(&receipt).unwrap()) {
+                Ok(()) => {
+                    emitter.emit(
+                        role,
+                        "RECEIPT_SAVED",
+                        serde_json::json!({
+                            "path": receipt_path.display().to_string(),
+                            "content_hash": content_hash,
+                            "message": "Purchase receipt saved.",
+                        }),
+                    );
+                }
+                Err(e) => {
+                    eprintln!("[buy-pre] failed to write receipt: {e}");
+                }
+            }
+        }
+    }
 
     // 5. Recover AES key m via PRE decryption
     let m = match pre::buyer_decrypt_from_hex(

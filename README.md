@@ -32,7 +32,7 @@ Creator                                Buyer
    ── Payment 2: Chunk Transport (P2P) ──
 
 6. Seeder/creator serves chunks          5. Download encrypted chunks via
-   over iroh QUIC                           iroh QUIC (eMule ICS selection)
+   over iroh QUIC                           iroh QUIC (ICS rarest-first selection)
                                          6. Verify each chunk against Merkle root
                                          7. Decrypt with recovered key K
                                          8. Verify plaintext hash
@@ -75,7 +75,7 @@ src/
 ├── buy/
 │   ├── pre.rs       PRE buy flow (key recovery + P2P download)
 │   ├── direct.rs    Direct purchase flow
-│   ├── chunked.rs   eMule ICS chunk planning
+│   ├── chunked.rs   Intelligent Chunk Selection planning
 │   ├── multisource.rs  Multi-source download orchestration
 │   ├── ad.rs        Ad-subsidized purchase
 │   └── simple.rs    Simple single-source buy

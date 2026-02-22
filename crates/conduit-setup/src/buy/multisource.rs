@@ -1,5 +1,5 @@
 // ---------------------------------------------------------------------------
-// Multi-source chunk download with eMule ICS
+// Multi-source chunk download with Intelligent Chunk Selection (ICS)
 // ---------------------------------------------------------------------------
 
 use std::time::Duration;

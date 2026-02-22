@@ -4,6 +4,7 @@ pub mod chunks;
 pub mod content;
 pub mod p2p;
 pub mod pre;
+pub mod receipts;
 pub mod sse;
 pub mod tee;
 pub mod wallet;

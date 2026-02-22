@@ -1,5 +1,5 @@
 // ---------------------------------------------------------------------------
-// A5: Chunk planner — eMule Intelligent Chunk Selection (ICS)
+// A5: Chunk planner — Intelligent Chunk Selection (ICS)
 // ---------------------------------------------------------------------------
 
 use std::sync::Arc;
@@ -56,7 +56,7 @@ pub fn count_complete_sources(seeder_bitfields: &[Vec<bool>], chunk_count: usize
         .count()
 }
 
-/// eMule Intelligent Chunk Selection.
+/// Intelligent Chunk Selection (ICS).
 ///
 /// Selects one of three strategies based on `complete_sources`:
 ///   - **RELEASE** (<= 3): rarest-first, random tie-breaking
