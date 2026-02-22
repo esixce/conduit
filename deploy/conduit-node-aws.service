@@ -1,0 +1,19 @@
+[Unit]
+Description=Conduit Node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/conduit
+EnvironmentFile=/etc/conduit/node.env
+ExecStart=/home/ubuntu/conduit/target/release/conduit-setup serve
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=conduit-node
+
+[Install]
+WantedBy=multi-user.target
