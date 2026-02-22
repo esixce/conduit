@@ -323,6 +323,7 @@ pub fn handle_seed(
         pre_c2_hex: String::new(),
         pre_pk_creator_hex: String::new(),
         playback_policy: "open".to_string(),
+        creator_signature: String::new(),
     };
 
     {
@@ -374,10 +375,28 @@ pub fn handle_seed(
 }
 
 // ---------------------------------------------------------------------------
+// Creator-signed listing: canonical message for ECDSA signature
+// ---------------------------------------------------------------------------
+
+pub fn listing_canonical_message(
+    content_hash: &str,
+    encrypted_hash: &str,
+    encrypted_root: &str,
+    price_sats: u64,
+    creator_pubkey: &str,
+) -> String {
+    format!(
+        "conduit:listing:v1:{}:{}:{}:{}:{}",
+        content_hash, encrypted_hash, encrypted_root, price_sats, creator_pubkey
+    )
+}
+
+// ---------------------------------------------------------------------------
 // register command (add content to catalog)
 // ---------------------------------------------------------------------------
 
 pub fn handle_register(
+    node: &Arc<Node>,
     emitter: &ConsoleEmitter,
     storage_dir: &str,
     catalog: &Arc<std::sync::Mutex<Vec<CatalogEntry>>>,
@@ -537,6 +556,7 @@ pub fn handle_register(
         pre_c2_hex: pre_c2_hex.clone(),
         pre_pk_creator_hex: pre_pk_hex.clone(),
         playback_policy: "open".to_string(),
+        creator_signature: String::new(),
     };
 
     {
@@ -576,6 +596,30 @@ pub fn handle_register(
     println!("Catalog:        {}", catalog_path(storage_dir));
     println!();
 
+    // Sign the listing with the node's Lightning key
+    let encrypted_root_hex = hex::encode(enc_tree.root());
+    let creator_pubkey = registry_info
+        .as_ref()
+        .map(|i| i.node_pubkey.clone())
+        .unwrap_or_else(|| node.node_id().to_string());
+    let canonical_msg = listing_canonical_message(
+        &content_hash,
+        &encrypted_hash,
+        &encrypted_root_hex,
+        price,
+        &creator_pubkey,
+    );
+    let creator_signature = node.sign_message(canonical_msg.as_bytes());
+
+    // Persist signature in catalog
+    {
+        let mut cat = catalog.lock().unwrap();
+        if let Some(e) = cat.iter_mut().find(|e| e.content_hash == content_hash) {
+            e.creator_signature = creator_signature.clone();
+        }
+        save_catalog(storage_dir, &cat);
+    }
+
     // Push listing to registry (blocking)
     if let Some(ref info) = registry_info {
         let body = serde_json::json!({
@@ -587,7 +631,7 @@ pub fn handle_register(
             "chunk_size": meta.chunk_size,
             "chunk_count": meta.count,
             "plaintext_root": hex::encode(plain_tree.root()),
-            "encrypted_root": hex::encode(enc_tree.root()),
+            "encrypted_root": &encrypted_root_hex,
             "creator_pubkey": &info.node_pubkey,
             "creator_address": &info.http_address,
             "creator_ln_address": &info.ln_address,
@@ -597,6 +641,7 @@ pub fn handle_register(
             "pre_c2_hex": &pre_c2_hex,
             "pre_pk_creator_hex": &pre_pk_hex,
             "playback_policy": "open",
+            "creator_signature": &creator_signature,
         });
         let url = format!("{}/api/listings", info.url);
         match reqwest::blocking::Client::new()
