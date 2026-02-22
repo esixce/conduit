@@ -42,13 +42,18 @@ impl BuyerClient {
     /// 1. HANDSHAKE → receive BITFIELD
     /// 2. REQUEST(indices) → receive INVOICE
     /// 3. Pay invoice off-band → PAYMENT_PROOF(preimage)
-    /// 4. Receive CHUNK messages
+    /// 4. Receive CHUNK messages (each Merkle-verified)
+    ///
+    /// If `expected_encrypted_root` is provided, the seeder's Bitfield
+    /// `encrypted_root` is cross-checked against it to prevent MITM attacks
+    /// where a malicious seeder fabricates a fake root matching fake chunks.
     pub async fn download(
         &self,
         seeder_addr: EndpointAddr,
         encrypted_hash: [u8; 32],
         desired_indices: &[u32],
         payment: std::sync::Arc<dyn PaymentHandler>,
+        expected_encrypted_root: Option<[u8; 32]>,
     ) -> Result<DownloadResult> {
         let conn = tokio::time::timeout(
             std::time::Duration::from_secs(15),
@@ -60,7 +65,7 @@ impl BuyerClient {
 
         info!(hash = hex::encode(encrypted_hash), "connected to seeder");
 
-        self.run_session(conn, encrypted_hash, desired_indices, payment)
+        self.run_session(conn, encrypted_hash, desired_indices, payment, expected_encrypted_root)
             .await
     }
 
@@ -70,6 +75,7 @@ impl BuyerClient {
         encrypted_hash: [u8; 32],
         desired_indices: &[u32],
         payment: std::sync::Arc<dyn PaymentHandler>,
+        expected_encrypted_root: Option<[u8; 32]>,
     ) -> Result<DownloadResult> {
         let (mut send, mut recv) = conn.open_bi().await?;
 
@@ -93,6 +99,19 @@ impl BuyerClient {
             chunk_size = bitfield.chunk_size,
             "received bitfield"
         );
+
+        let encrypted_root = bitfield.encrypted_root;
+
+        if let Some(expected) = expected_encrypted_root {
+            if encrypted_root != expected {
+                anyhow::bail!(
+                    "seeder encrypted_root mismatch: expected {}, got {} -- possible MITM",
+                    hex::encode(expected),
+                    hex::encode(encrypted_root)
+                );
+            }
+            info!("encrypted_root matches registry expectation");
+        }
 
         let available: Vec<u32> = desired_indices
             .iter()
@@ -161,10 +180,31 @@ impl BuyerClient {
                 })?;
             match msg? {
                 Message::Chunk(chunk) => {
+                    let merkle_proof = conduit_core::merkle::MerkleProof {
+                        siblings: chunk
+                            .proof
+                            .iter()
+                            .map(|pn| (pn.hash, pn.is_left))
+                            .collect(),
+                    };
+                    if !merkle_proof.verify(
+                        &chunk.data,
+                        chunk.chunk_index as usize,
+                        &encrypted_root,
+                    ) {
+                        warn!(
+                            index = chunk.chunk_index,
+                            "Merkle proof FAILED -- rejecting chunk"
+                        );
+                        anyhow::bail!(
+                            "chunk {} failed Merkle verification (source may be malicious)",
+                            chunk.chunk_index
+                        );
+                    }
                     debug!(
                         index = chunk.chunk_index,
                         size = chunk.data.len(),
-                        "received chunk"
+                        "chunk verified"
                     );
                     chunks.push((chunk.chunk_index, chunk.data));
                     received += 1;
@@ -187,7 +227,7 @@ impl BuyerClient {
         info!(
             chunks_received = chunks.len(),
             total_paid_msat = invoice.amount_msat,
-            "download complete"
+            "download complete — all chunks Merkle-verified"
         );
 
         Ok(DownloadResult {

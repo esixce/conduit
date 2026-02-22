@@ -4,6 +4,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
+use conduit_core::merkle::MerkleTree;
 use conduit_p2p::handler::{ChunkProtocol, ChunkStore};
 use conduit_p2p::node::{P2pConfig, P2pNode};
 use conduit_p2p::wire::{Bitfield, ProofNode};
@@ -14,8 +15,23 @@ const CHUNK_SIZE: u32 = 4;
 const CHUNK_DATA: [[u8; 4]; 3] = [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12]];
 const FAKE_PREIMAGE: [u8; 32] = [0xBB; 32];
 
+fn build_test_tree() -> MerkleTree {
+    let chunks: Vec<Vec<u8>> = CHUNK_DATA.iter().map(|c| c.to_vec()).collect();
+    MerkleTree::from_chunks(&chunks)
+}
+
 #[derive(Debug)]
-struct MockStore;
+struct MockStore {
+    tree: MerkleTree,
+}
+
+impl MockStore {
+    fn new() -> Self {
+        Self {
+            tree: build_test_tree(),
+        }
+    }
+}
 
 impl ChunkStore for MockStore {
     fn get_chunk(&self, hash: &[u8; 32], index: u32) -> Option<Vec<u8>> {
@@ -28,10 +44,17 @@ impl ChunkStore for MockStore {
 
     fn get_proof(&self, hash: &[u8; 32], index: u32) -> Option<Vec<ProofNode>> {
         if hash == &TEST_ENCRYPTED_HASH && (index as usize) < CHUNK_DATA.len() {
-            Some(vec![ProofNode {
-                hash: [index as u8; 32],
-                is_left: index % 2 == 0,
-            }])
+            let proof = self.tree.proof(index as usize);
+            Some(
+                proof
+                    .siblings
+                    .iter()
+                    .map(|(h, is_left)| ProofNode {
+                        hash: *h,
+                        is_left: *is_left,
+                    })
+                    .collect(),
+            )
         } else {
             None
         }
@@ -42,7 +65,7 @@ impl ChunkStore for MockStore {
             Some(Bitfield::from_bools(
                 &[true, true, true],
                 CHUNK_SIZE,
-                [0xCC; 32],
+                self.tree.root(),
             ))
         } else {
             None
@@ -76,7 +99,7 @@ impl conduit_p2p::client::PaymentHandler for MockPayment {
 async fn test_full_download_flow() {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let store = Arc::new(MockStore);
+    let store = Arc::new(MockStore::new());
     let handler = Arc::new(ChunkProtocol::new(store));
 
     let seeder = P2pNode::spawn(
@@ -104,7 +127,7 @@ async fn test_full_download_flow() {
     );
 
     let result = client
-        .download(seeder_addr, TEST_ENCRYPTED_HASH, &[0, 1, 2], Arc::new(MockPayment))
+        .download(seeder_addr, TEST_ENCRYPTED_HASH, &[0, 1, 2], Arc::new(MockPayment), None)
         .await
         .expect("download failed");
 
