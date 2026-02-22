@@ -62,6 +62,7 @@ fn start_http_server(port: u16, state: AppState) {
     use handlers::chunks::*;
     use handlers::p2p::*;
     use handlers::pre::*;
+    use handlers::receipts::*;
     use handlers::sse::*;
     use handlers::tee::*;
     use handlers::wallet::*;
@@ -152,6 +153,8 @@ fn start_http_server(port: u16, state: AppState) {
                 )
                 .route("/api/pre-info", get(pre_info_handler))
                 .route("/api/pre-reencrypt", post(pre_reencrypt_handler))
+                // Purchase receipts
+                .route("/api/receipts", get(receipts_handler))
                 // TEE trust list + attestation routes
                 .route(
                     "/api/trusted-manufacturers",
@@ -405,7 +408,7 @@ fn main() {
                 use sha2::Digest;
                 let mut h = sha2::Sha256::new();
                 h.update(b"conduit-p2p-identity:");
-                h.update(config.storage_dir.as_bytes());
+                h.update(id.as_bytes());
                 let hash = h.finalize();
                 let mut s = [0u8; 32];
                 s.copy_from_slice(&hash);
@@ -495,6 +498,7 @@ fn main() {
 
         Commands::Register { file, price } => {
             handle_register(
+                &node,
                 emitter.as_ref(),
                 &config.storage_dir,
                 &catalog,

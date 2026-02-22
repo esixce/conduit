@@ -158,7 +158,10 @@ pub async fn pre_purchase_handler(
         &state.node,
         &htlc_preimage,
         entry.price_sats,
-        &format!("PRE:{}", entry.file_name),
+        &format!(
+            "conduit:pre:{}:{}:{}",
+            entry.content_hash, req.buyer_pk_hex, entry.price_sats
+        ),
     ) {
         Ok(b) => b,
         Err(e) => {
@@ -210,6 +213,8 @@ pub async fn pre_purchase_handler(
         "price_sats": entry.price_sats,
         "file_name": entry.file_name,
         "size_bytes": entry.size_bytes,
+        "creator_pubkey": invoice::node_id(&state.node),
+        "creator_signature": entry.creator_signature,
     }))
     .into_response()
 }
