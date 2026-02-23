@@ -1,6 +1,8 @@
 //! Buyer-side P2P client: connects to seeders, exchanges bitfields,
 //! requests chunks, pays invoices, downloads chunk data.
 
+use std::path::{Path, PathBuf};
+
 use anyhow::{Context, Result};
 use iroh::endpoint::Connection;
 use iroh::{Endpoint, EndpointAddr};
@@ -8,12 +10,89 @@ use tracing::{debug, info, warn};
 
 use crate::wire::*;
 
+/// Receives verified chunks during download. Implementations decide where
+/// data goes (RAM, disk, etc.).
+pub trait DownloadSink: Send + Sync + 'static {
+    fn write_chunk(&self, index: u32, data: &[u8]) -> Result<()>;
+    fn on_progress(&self, received: u32, total: u32) {
+        let _ = (received, total);
+    }
+}
+
+/// Writes each chunk to `{dir}/{index}.bin`, keeping memory bounded.
+pub struct DiskSink {
+    dir: PathBuf,
+}
+
+impl DiskSink {
+    pub fn new(dir: &Path) -> Result<Self> {
+        std::fs::create_dir_all(dir)?;
+        Ok(Self {
+            dir: dir.to_path_buf(),
+        })
+    }
+
+    pub fn chunk_path(&self, index: u32) -> PathBuf {
+        self.dir.join(format!("{index}.bin"))
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Read chunks back from disk in order and concatenate.
+    pub fn reassemble(&self, count: u32) -> Result<Vec<u8>> {
+        let mut data = Vec::new();
+        for i in 0..count {
+            let p = self.chunk_path(i);
+            let chunk = std::fs::read(&p)
+                .with_context(|| format!("reading chunk {} from {}", i, p.display()))?;
+            data.extend_from_slice(&chunk);
+        }
+        Ok(data)
+    }
+}
+
+impl DownloadSink for DiskSink {
+    fn write_chunk(&self, index: u32, data: &[u8]) -> Result<()> {
+        std::fs::write(self.chunk_path(index), data)?;
+        Ok(())
+    }
+}
+
+/// Collects chunks in memory (original behavior, for small files and tests).
+pub struct MemorySink {
+    chunks: std::sync::Mutex<Vec<(u32, Vec<u8>)>>,
+}
+
+impl MemorySink {
+    pub fn new() -> Self {
+        Self {
+            chunks: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+    pub fn into_chunks(self) -> Vec<(u32, Vec<u8>)> {
+        self.chunks.into_inner().unwrap()
+    }
+}
+
+impl DownloadSink for MemorySink {
+    fn write_chunk(&self, index: u32, data: &[u8]) -> Result<()> {
+        self.chunks.lock().unwrap().push((index, data.to_vec()));
+        Ok(())
+    }
+}
+
 /// Result of a successful chunk download session.
+#[derive(Debug)]
 pub struct DownloadResult {
     /// The downloaded chunks, indexed by chunk_index.
+    /// Empty when using a sink -- chunks were written there instead.
     pub chunks: Vec<(u32, Vec<u8>)>,
     /// Total amount paid in millisatoshis.
     pub total_paid_msat: u64,
+    /// Number of chunks received.
+    pub chunks_received: u32,
 }
 
 /// Trait the buyer's application implements for Lightning payments.
@@ -36,17 +115,8 @@ impl BuyerClient {
         }
     }
 
-    /// Connect to a seeder and download the specified chunks.
-    ///
-    /// Flow:
-    /// 1. HANDSHAKE → receive BITFIELD
-    /// 2. REQUEST(indices) → receive INVOICE
-    /// 3. Pay invoice off-band → PAYMENT_PROOF(preimage)
-    /// 4. Receive CHUNK messages (each Merkle-verified)
-    ///
-    /// If `expected_encrypted_root` is provided, the seeder's Bitfield
-    /// `encrypted_root` is cross-checked against it to prevent MITM attacks
-    /// where a malicious seeder fabricates a fake root matching fake chunks.
+    /// Connect to a seeder and download the specified chunks into memory.
+    /// For large files, prefer `download_to_sink` with a `DiskSink`.
     pub async fn download(
         &self,
         seeder_addr: EndpointAddr,
@@ -54,6 +124,40 @@ impl BuyerClient {
         desired_indices: &[u32],
         payment: std::sync::Arc<dyn PaymentHandler>,
         expected_encrypted_root: Option<[u8; 32]>,
+    ) -> Result<DownloadResult> {
+        let sink = std::sync::Arc::new(MemorySink::new());
+        let mut result = self
+            .download_to_sink(
+                seeder_addr,
+                encrypted_hash,
+                desired_indices,
+                payment,
+                expected_encrypted_root,
+                sink.clone(),
+            )
+            .await?;
+        let sink = std::sync::Arc::try_unwrap(sink)
+            .map_err(|_| anyhow::anyhow!("sink still referenced"))?;
+        result.chunks = sink.into_chunks();
+        Ok(result)
+    }
+
+    /// Connect to a seeder and download the specified chunks, writing each
+    /// verified chunk to `sink` as it arrives. Keeps memory bounded.
+    ///
+    /// Flow:
+    /// 1. HANDSHAKE -> receive BITFIELD
+    /// 2. REQUEST(indices) -> receive INVOICE
+    /// 3. Pay invoice off-band -> PAYMENT_PROOF(preimage)
+    /// 4. Receive CHUNK messages (each Merkle-verified, written to sink)
+    pub async fn download_to_sink(
+        &self,
+        seeder_addr: EndpointAddr,
+        encrypted_hash: [u8; 32],
+        desired_indices: &[u32],
+        payment: std::sync::Arc<dyn PaymentHandler>,
+        expected_encrypted_root: Option<[u8; 32]>,
+        sink: std::sync::Arc<dyn DownloadSink>,
     ) -> Result<DownloadResult> {
         let conn = tokio::time::timeout(
             std::time::Duration::from_secs(15),
@@ -65,8 +169,15 @@ impl BuyerClient {
 
         info!(hash = hex::encode(encrypted_hash), "connected to seeder");
 
-        self.run_session(conn, encrypted_hash, desired_indices, payment, expected_encrypted_root)
-            .await
+        self.run_session(
+            conn,
+            encrypted_hash,
+            desired_indices,
+            payment,
+            expected_encrypted_root,
+            sink,
+        )
+        .await
     }
 
     async fn run_session(
@@ -76,6 +187,7 @@ impl BuyerClient {
         desired_indices: &[u32],
         payment: std::sync::Arc<dyn PaymentHandler>,
         expected_encrypted_root: Option<[u8; 32]>,
+        sink: std::sync::Arc<dyn DownloadSink>,
     ) -> Result<DownloadResult> {
         let (mut send, mut recv) = conn.open_bi().await?;
 
@@ -165,17 +277,18 @@ impl BuyerClient {
 
         write_msg(&mut send, &Message::PaymentProof(PaymentProof { preimage })).await?;
 
-        let mut chunks = Vec::with_capacity(available.len());
         let mut received = 0u32;
 
         while received < invoice.chunk_count {
-            let msg = tokio::time::timeout(std::time::Duration::from_secs(30), read_msg(&mut recv))
+            let per_chunk_timeout = std::time::Duration::from_secs(60);
+            let msg = tokio::time::timeout(per_chunk_timeout, read_msg(&mut recv))
                 .await
                 .map_err(|_| {
                     anyhow::anyhow!(
-                        "timed out waiting for chunk {}/{}",
+                        "timed out waiting for chunk {}/{} (received {} so far)",
                         received + 1,
-                        invoice.chunk_count
+                        invoice.chunk_count,
+                        received
                     )
                 })?;
             match msg? {
@@ -206,11 +319,17 @@ impl BuyerClient {
                         size = chunk.data.len(),
                         "chunk verified"
                     );
-                    chunks.push((chunk.chunk_index, chunk.data));
+                    sink.write_chunk(chunk.chunk_index, &chunk.data)?;
                     received += 1;
+                    sink.on_progress(received, invoice.chunk_count);
                 }
                 Message::Reject(r) => {
-                    anyhow::bail!("seeder rejected mid-transfer: {:?}", r.reason);
+                    anyhow::bail!(
+                        "seeder rejected mid-transfer: {:?} (received {}/{})",
+                        r.reason,
+                        received,
+                        invoice.chunk_count
+                    );
                 }
                 other => {
                     warn!(
@@ -225,14 +344,15 @@ impl BuyerClient {
         conn.close(0u8.into(), b"done");
 
         info!(
-            chunks_received = chunks.len(),
+            chunks_received = received,
             total_paid_msat = invoice.amount_msat,
             "download complete — all chunks Merkle-verified"
         );
 
         Ok(DownloadResult {
-            chunks,
+            chunks: Vec::new(),
             total_paid_msat: invoice.amount_msat,
+            chunks_received: received,
         })
     }
 }

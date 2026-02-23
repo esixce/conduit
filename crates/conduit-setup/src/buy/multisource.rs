@@ -224,9 +224,10 @@ pub fn fetch_bitfields(
 ///
 /// Each chunk is downloaded from its assigned source via HTTP. Chunks are
 /// downloaded in the order specified by `download_order` and reassembled
-/// in sequential order.
+/// in sequential order. Preserved for future HTTP re-enablement.
 ///
 /// Returns the concatenated encrypted data.
+#[allow(dead_code)]
 pub fn download_chunks_multisource(
     client: &reqwest::blocking::Client,
     sources: &[ChunkSource],
@@ -352,6 +353,10 @@ pub fn download_chunks_multisource(
 
 /// High-level ICS download: discover sources, fetch bitfields, plan, download.
 ///
+/// If P2P-capable sources are found, downloads chunks via iroh QUIC in parallel
+/// across multiple seeders. Falls back to single-source if no P2P sources or
+/// no registry is configured.
+///
 /// Returns `(encrypted_data, num_chunks, ics_mode)` or None on failure.
 pub fn ics_download(
     client: &reqwest::blocking::Client,
@@ -359,6 +364,12 @@ pub fn ics_download(
     creator_url: &str,
     content_hash: &str,
     emitter: &ConsoleEmitter,
+    p2p_node: Option<&std::sync::Arc<conduit_p2p::node::P2pNode>>,
+    p2p_runtime_handle: Option<&tokio::runtime::Handle>,
+    node: &std::sync::Arc<ldk_node::Node>,
+    event_router: &std::sync::Arc<crate::events::EventRouter>,
+    storage_dir: &str,
+    expected_encrypted_root: Option<[u8; 32]>,
 ) -> Option<(Vec<u8>, usize, IcsMode)> {
     let role = "buyer";
 
@@ -458,26 +469,229 @@ pub fn ics_download(
         }),
     );
 
-    emitter.emit(
-        role,
-        "ICS_FALLBACK",
-        serde_json::json!({
-            "message": "ICS multi-source via HTTP is disabled. Using P2P single-source with Merkle verification.",
-        }),
-    );
-    return None;
+    let p2p = match (p2p_node, p2p_runtime_handle) {
+        (Some(p), Some(rt)) => Some((p.clone(), rt.clone())),
+        _ => None,
+    };
 
-    #[allow(unreachable_code)]
-    let data = download_chunks_multisource(
-        client,
-        &sources,
-        &assignments,
-        &order,
-        &encrypted_hash,
-        chunk_count,
-        emitter,
-        mode,
-    )?;
+    let p2p_sources: Vec<(usize, &ChunkSource)> = sources
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.p2p_enabled && s.p2p_node_id.is_some())
+        .collect();
 
-    Some((data, chunk_count, mode))
+    if p2p.is_none() || p2p_sources.is_empty() {
+        emitter.emit(
+            role,
+            "ICS_FALLBACK",
+            serde_json::json!({
+                "message": "No P2P-capable sources found, falling back to single-source.",
+                "p2p_available": p2p.is_some(),
+                "p2p_sources": p2p_sources.len(),
+            }),
+        );
+        return None;
+    }
+
+    let (p2p_node_arc, p2p_rt) = p2p.unwrap();
+    let enc_hash_bytes: [u8; 32] = hex::decode(&encrypted_hash)
+        .ok()
+        .and_then(|b| <[u8; 32]>::try_from(b).ok())?;
+
+    // Group chunks by assigned source index
+    let mut per_source: std::collections::HashMap<usize, Vec<u32>> =
+        std::collections::HashMap::new();
+    for &ci in &order {
+        if let Some(si) = assignments[ci] {
+            per_source.entry(si).or_default().push(ci as u32);
+        }
+    }
+
+    let sink_dir = std::path::PathBuf::from(storage_dir)
+        .join("tmp_chunks")
+        .join(&encrypted_hash);
+    let disk_sink = match conduit_p2p::client::DiskSink::new(&sink_dir) {
+        Ok(s) => std::sync::Arc::new(s),
+        Err(e) => {
+            eprintln!("[ICS-P2P] failed to create disk sink: {e}");
+            return None;
+        }
+    };
+
+    let ep = p2p_node_arc.endpoint().clone();
+    let ln_pk = node.node_id().to_string();
+
+    // Build EndpointAddr for each P2P source
+    let build_addr = |src: &ChunkSource| -> Option<conduit_p2p::iroh::EndpointAddr> {
+        let pk = src
+            .p2p_node_id
+            .as_ref()?
+            .parse::<conduit_p2p::iroh::PublicKey>()
+            .ok()?;
+        let mut addr = conduit_p2p::iroh::EndpointAddr::from(pk);
+        for s in &src.p2p_direct_addrs {
+            if let Ok(sa) = s.parse::<std::net::SocketAddr>() {
+                addr = addr.with_ip_addr(sa);
+            }
+        }
+        for u in &src.p2p_relay_urls {
+            if let Ok(ru) = u.parse::<conduit_p2p::iroh::RelayUrl>() {
+                addr = addr.with_relay_url(ru);
+            }
+        }
+        Some(addr)
+    };
+
+    // Spawn parallel P2P downloads per source
+    let (tx, rx) = std::sync::mpsc::channel::<(usize, anyhow::Result<u32>)>();
+
+    let mut spawned = 0usize;
+    for (si, chunk_indices) in &per_source {
+        let src = match sources.get(*si) {
+            Some(s) => s,
+            None => continue,
+        };
+        let addr = match build_addr(src) {
+            Some(a) => a,
+            None => {
+                eprintln!("[ICS-P2P] cannot build P2P addr for source {}", src.url);
+                continue;
+            }
+        };
+
+        let buyer_client =
+            conduit_p2p::client::BuyerClient::new(ep.clone(), ln_pk.clone());
+        let indices = chunk_indices.clone();
+        let sink: std::sync::Arc<dyn conduit_p2p::client::DownloadSink> = disk_sink.clone();
+        let tx = tx.clone();
+        let si = *si;
+        let node_for_pay = node.clone();
+        let router_for_pay = event_router.clone();
+
+        use conduit_core::invoice;
+        use ldk_node::lightning_types::payment::PaymentHash;
+        use ldk_node::Event;
+        struct LdkPay {
+            node: std::sync::Arc<ldk_node::Node>,
+            router: std::sync::Arc<crate::events::EventRouter>,
+        }
+        impl conduit_p2p::client::PaymentHandler for LdkPay {
+            fn pay_invoice(&self, bolt11: &str) -> anyhow::Result<[u8; 32]> {
+                use ldk_node::lightning_invoice::Bolt11Invoice;
+                let inv: Bolt11Invoice = bolt11
+                    .parse()
+                    .map_err(|e: ldk_node::lightning_invoice::ParseOrSemanticError| {
+                        anyhow::anyhow!("bad bolt11: {e}")
+                    })?;
+                let h: &[u8] = inv.payment_hash().as_ref();
+                let mut hash = [0u8; 32];
+                hash.copy_from_slice(h);
+                let target = PaymentHash(hash);
+                let rx = self.router.register(target);
+                invoice::pay_invoice(&self.node, bolt11)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                loop {
+                    let event = rx.recv().map_err(|_| anyhow::anyhow!("event router dropped"))?;
+                    match event {
+                        Event::PaymentSuccessful {
+                            payment_preimage: Some(pre),
+                            ..
+                        } => {
+                            self.router.unregister(&target);
+                            return Ok(pre.0);
+                        }
+                        Event::PaymentFailed { reason, .. } => {
+                            self.router.unregister(&target);
+                            return Err(anyhow::anyhow!("payment failed: {:?}", reason));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        let payment: std::sync::Arc<dyn conduit_p2p::client::PaymentHandler> =
+            std::sync::Arc::new(LdkPay {
+                node: node_for_pay,
+                router: router_for_pay,
+            });
+
+        let expected_root = expected_encrypted_root;
+
+        p2p_rt.spawn(async move {
+            let result = buyer_client
+                .download_to_sink(addr, enc_hash_bytes, &indices, payment, expected_root, sink)
+                .await;
+            let count = match &result {
+                Ok(r) => Ok(r.chunks_received),
+                Err(e) => Err(anyhow::anyhow!("{e}")),
+            };
+            let _ = tx.send((si, count));
+        });
+        spawned += 1;
+    }
+    drop(tx);
+
+    let mut total_received = 0u32;
+    let mut errors = Vec::new();
+    for _ in 0..spawned {
+        match rx.recv_timeout(Duration::from_secs(60 + (chunk_count as u64) * 2)) {
+            Ok((si, Ok(n))) => {
+                eprintln!(
+                    "[ICS-P2P] source {} delivered {} chunks",
+                    sources.get(si).map(|s| s.url.as_str()).unwrap_or("?"),
+                    n
+                );
+                total_received += n;
+            }
+            Ok((si, Err(e))) => {
+                let url = sources.get(si).map(|s| s.url.as_str()).unwrap_or("?");
+                eprintln!("[ICS-P2P] source {} failed: {e}", url);
+                errors.push(format!("{}: {}", url, e));
+            }
+            Err(_) => {
+                eprintln!("[ICS-P2P] timed out waiting for source download");
+                errors.push("timeout waiting for download".to_string());
+                break;
+            }
+        }
+    }
+
+    if total_received < chunk_count as u32 {
+        emitter.emit(
+            role,
+            "ICS_INCOMPLETE",
+            serde_json::json!({
+                "received": total_received,
+                "expected": chunk_count,
+                "errors": errors,
+                "message": format!("Only received {}/{} chunks", total_received, chunk_count),
+            }),
+        );
+        let _ = std::fs::remove_dir_all(&sink_dir);
+        return None;
+    }
+
+    match disk_sink.reassemble(chunk_count as u32) {
+        Ok(data) => {
+            let _ = std::fs::remove_dir_all(&sink_dir);
+            emitter.emit(
+                role,
+                "ICS_DOWNLOAD_COMPLETE",
+                serde_json::json!({
+                    "mode": mode.label(),
+                    "chunks": chunk_count,
+                    "bytes": data.len(),
+                    "sources_used": per_source.len(),
+                    "message": format!("ICS {} complete: {} chunks from {} sources",
+                        mode.label(), chunk_count, per_source.len()),
+                }),
+            );
+            Some((data, chunk_count, mode))
+        }
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&sink_dir);
+            eprintln!("[ICS-P2P] reassembly failed: {e}");
+            None
+        }
+    }
 }

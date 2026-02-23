@@ -9,6 +9,7 @@ use ldk_node::bitcoin::Network;
 use ldk_node::lightning::ln::msgs::SocketAddress;
 use ldk_node::lightning_invoice::{Bolt11InvoiceDescription, Description};
 use ldk_node::lightning_types::payment::{PaymentHash, PaymentPreimage};
+use ldk_node::config::Config as LdkConfig;
 use ldk_node::{Builder, Event, Node};
 use thiserror::Error;
 
@@ -67,6 +68,10 @@ pub struct LightningConfig {
     pub chain_source: ChainSource,
     /// Human-readable node alias (max 32 bytes UTF-8). Gossiped to the Lightning network.
     pub node_alias: Option<String>,
+    /// Hex-encoded public keys of peers trusted for 0-conf channels.
+    /// Channels with these peers become usable immediately without waiting
+    /// for on-chain confirmations. Essential for test networks.
+    pub trusted_peers_0conf: Vec<String>,
 }
 
 impl Default for LightningConfig {
@@ -77,6 +82,7 @@ impl Default for LightningConfig {
             listening_port: 9735,
             chain_source: ChainSource::Esplora("https://mempool.space/signet/api".into()),
             node_alias: None,
+            trusted_peers_0conf: Vec::new(),
         }
     }
 }
@@ -112,10 +118,29 @@ pub struct PaymentReceived {
 /// The node begins syncing with the chain and listening for peers.
 /// Call `node.stop()` when done.
 pub fn start_node(config: &LightningConfig) -> Result<Node, InvoiceError> {
-    let mut builder = Builder::new();
+    use ldk_node::bitcoin::secp256k1::PublicKey;
 
-    builder.set_network(config.network);
-    builder.set_storage_dir_path(config.storage_dir.clone());
+    let trusted: Vec<PublicKey> = config
+        .trusted_peers_0conf
+        .iter()
+        .filter_map(|hex| hex.parse::<PublicKey>().ok())
+        .collect();
+
+    if !trusted.is_empty() {
+        eprintln!(
+            "[ldk] 0-conf trusted peers: {} node(s)",
+            trusted.len()
+        );
+    }
+
+    let ldk_cfg = LdkConfig {
+        storage_dir_path: config.storage_dir.clone(),
+        network: config.network,
+        trusted_peers_0conf: trusted,
+        ..LdkConfig::default()
+    };
+
+    let mut builder = Builder::from_config(ldk_cfg);
 
     if let Some(ref alias) = config.node_alias {
         builder
@@ -637,6 +662,7 @@ mod tests {
             listening_port: 19735,
             chain_source: ChainSource::Esplora("https://example.com/api".into()),
             node_alias: None,
+            trusted_peers_0conf: Vec::new(),
         };
         assert_eq!(config.storage_dir, "/custom/path");
         assert_eq!(config.network, Network::Bitcoin);
@@ -659,6 +685,7 @@ mod tests {
                 password: "rpcpass".into(),
             },
             node_alias: None,
+            trusted_peers_0conf: Vec::new(),
         };
         assert_eq!(config.listening_port, 29735);
         assert!(

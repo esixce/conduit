@@ -104,6 +104,14 @@ jobs:
             service_template: deploy/conduit-node.service
             binary_dir: /root/conduit/target/release
             old_service: conduit-owk50ga
+          - node: Buyer2
+            host_secret: BUYER2_HOST
+            ssh_key_secret: DEPLOY_SSH_KEY
+            username: root
+            env_file: deploy/envs/buyer2.env
+            service_template: deploy/conduit-node.service
+            binary_dir: /root/conduit/target/release
+            old_service: conduit-node
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4

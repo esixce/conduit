@@ -24,6 +24,9 @@ pub struct ConduitChunkStore {
     /// Active transport keys: encrypted_hash -> K_S bytes.
     /// When a buyer pays the invoice, the preimage (= K_S) is revealed.
     pending_keys: Arc<std::sync::Mutex<std::collections::HashMap<[u8; 32], [u8; 32]>>>,
+    /// Shared Merkle tree cache -- avoids re-reading the full encrypted file
+    /// on every get_proof() / get_bitfield() call.
+    merkle_cache: MerkleTreeCache,
 }
 
 impl std::fmt::Debug for ConduitChunkStore {
@@ -40,6 +43,7 @@ impl ConduitChunkStore {
             emitter: state.emitter.clone(),
             event_router: state.event_router.clone(),
             pending_keys: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            merkle_cache: state.merkle_cache.clone(),
         }
     }
 
@@ -58,6 +62,38 @@ impl ConduitChunkStore {
         };
         let (enc_chunks, _) = chunk::split(&encrypted, cs);
         Some(enc_chunks)
+    }
+
+    /// Return a cached Merkle tree for the given hash, building it on first access.
+    /// The tree stores only hashes (~32 bytes per node), not chunk data.
+    fn ensure_tree(&self, encrypted_hash: &[u8; 32]) -> Option<MerkleTree> {
+        {
+            let cache = self.merkle_cache.read().unwrap();
+            if let Some(tree) = cache.get(encrypted_hash) {
+                return Some(tree.clone());
+            }
+        }
+        let entry = self.find_entry(encrypted_hash)?;
+        let chunks = self.load_chunks(&entry)?;
+        let tree = MerkleTree::from_chunks(&chunks);
+        {
+            let mut cache = self.merkle_cache.write().unwrap();
+            cache.insert(*encrypted_hash, tree.clone());
+        }
+        Some(tree)
+    }
+
+    fn chunk_count_from_metadata(&self, entry: &CatalogEntry) -> Option<usize> {
+        if entry.chunk_count > 0 {
+            return Some(entry.chunk_count);
+        }
+        let file_len = std::fs::metadata(&entry.enc_file_path).ok()?.len() as usize;
+        let cs = if entry.chunk_size > 0 {
+            entry.chunk_size
+        } else {
+            chunk::select_chunk_size(file_len)
+        };
+        Some((file_len + cs - 1) / cs)
     }
 }
 
@@ -91,12 +127,10 @@ impl conduit_p2p::handler::ChunkStore for ConduitChunkStore {
         encrypted_hash: &[u8; 32],
         index: u32,
     ) -> Option<Vec<conduit_p2p::wire::ProofNode>> {
-        let entry = self.find_entry(encrypted_hash)?;
-        let chunks = self.load_chunks(&entry)?;
-        if index as usize >= chunks.len() {
+        let tree = self.ensure_tree(encrypted_hash)?;
+        if index as usize >= tree.leaf_count {
             return None;
         }
-        let tree = MerkleTree::from_chunks(&chunks);
         let proof = tree.proof(index as usize);
         Some(
             proof
@@ -112,8 +146,7 @@ impl conduit_p2p::handler::ChunkStore for ConduitChunkStore {
 
     fn get_bitfield(&self, encrypted_hash: &[u8; 32]) -> Option<conduit_p2p::wire::Bitfield> {
         let entry = self.find_entry(encrypted_hash)?;
-        let chunks = self.load_chunks(&entry)?;
-        let total = chunks.len() as u32;
+        let total = self.chunk_count_from_metadata(&entry)? as u32;
         let available: Vec<bool> = if entry.chunks_held.is_empty() {
             vec![true; total as usize]
         } else {
@@ -124,7 +157,8 @@ impl conduit_p2p::handler::ChunkStore for ConduitChunkStore {
         let cs = if entry.chunk_size > 0 {
             entry.chunk_size as u32
         } else {
-            chunk::select_chunk_size(0) as u32
+            let file_len = std::fs::metadata(&entry.enc_file_path).ok()?.len() as usize;
+            chunk::select_chunk_size(file_len) as u32
         };
         let root = hex::decode(&entry.encrypted_root)
             .ok()
@@ -643,7 +677,7 @@ pub async fn p2p_test_download_handler(
     match outcome {
         Ok(Ok(Ok(Ok(result)))) => Json(serde_json::json!({
             "status": "download_complete",
-            "chunks_received": result.chunks.len(),
+            "chunks_received": result.chunks_received,
             "total_paid_msat": result.total_paid_msat,
             "elapsed_ms": elapsed.as_millis(),
             "message": "Full protocol succeeded (mock payment accepted by seeder)",

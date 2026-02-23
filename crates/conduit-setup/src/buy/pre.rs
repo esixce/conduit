@@ -447,7 +447,19 @@ pub fn handle_buy_pre(
             "ICS_MODE",
             serde_json::json!({ "message": "Using ICS multi-source download" }),
         );
-        multisource::ics_download(&client, registry_url, creator_url, content_hash, emitter)
+        multisource::ics_download(
+            &client,
+            registry_url,
+            creator_url,
+            content_hash,
+            emitter,
+            p2p_node.as_ref(),
+            p2p_runtime_handle.as_ref(),
+            node,
+            router,
+            storage_dir,
+            expected_encrypted_root,
+        )
     } else {
         None
     };
@@ -703,60 +715,139 @@ pub fn handle_buy_pre(
                                     let indices_owned = indices.clone();
                                     let num_indices = indices_owned.len();
                                     eprintln!("[P2P-BUY] spawning download: {} chunks, hash={}", num_indices, hex::encode(hash_bytes));
+
+                                    let sink_dir = std::path::PathBuf::from(storage_dir).join("tmp_chunks").join(hex::encode(hash_bytes));
+                                    let disk_sink = match conduit_p2p::client::DiskSink::new(&sink_dir) {
+                                        Ok(s) => std::sync::Arc::new(s),
+                                        Err(e) => {
+                                            eprintln!("[P2P-BUY] failed to create disk sink: {e}");
+                                            return; // returns from handle_buy_pre entirely
+                                        }
+                                    };
+                                    let event_tx = emitter.sender();
+                                    struct ProgressSink {
+                                        inner: std::sync::Arc<conduit_p2p::client::DiskSink>,
+                                        tx: tokio::sync::broadcast::Sender<crate::events::ConsoleEvent>,
+                                        role: String,
+                                        fib_set: std::collections::HashSet<u32>,
+                                    }
+                                    impl conduit_p2p::client::DownloadSink for ProgressSink {
+                                        fn write_chunk(&self, index: u32, data: &[u8]) -> anyhow::Result<()> {
+                                            self.inner.write_chunk(index, data)
+                                        }
+                                        fn on_progress(&self, received: u32, total: u32) {
+                                            if received == total || self.fib_set.contains(&received) {
+                                                let event = crate::events::ConsoleEvent {
+                                                    id: 0,
+                                                    timestamp: crate::events::now_ts(),
+                                                    role: self.role.clone(),
+                                                    event_type: "CHUNK_PROGRESS".into(),
+                                                    data: serde_json::json!({
+                                                        "received": received,
+                                                        "total": total,
+                                                        "message": format!("{}/{} chunks downloaded", received, total),
+                                                    }),
+                                                };
+                                                let _ = self.tx.send(event);
+                                            }
+                                        }
+                                    }
+                                    fn fibonacci_report_set(total: u32) -> std::collections::HashSet<u32> {
+                                        let mut set = std::collections::HashSet::new();
+                                        set.insert(1);
+                                        set.insert(total);
+                                        let (mut a, mut b) = (1u32, 2u32);
+                                        while a <= total {
+                                            set.insert(a);
+                                            let next = a.saturating_add(b);
+                                            a = b;
+                                            b = next;
+                                        }
+                                        set
+                                    }
+                                    let progress_sink: std::sync::Arc<dyn conduit_p2p::client::DownloadSink> = std::sync::Arc::new(ProgressSink {
+                                        inner: disk_sink.clone(),
+                                        tx: event_tx,
+                                        role: role.to_string(),
+                                        fib_set: fibonacci_report_set(num_indices as u32),
+                                    });
+
                                     let dl_start = std::time::Instant::now();
                                     p2p_rt.spawn(async move {
                                         eprintln!("[P2P-BUY] download task started on P2P runtime");
                                         let result = buyer_client
-                                            .download(
+                                            .download_to_sink(
                                                 addr,
                                                 hash_bytes,
                                                 &indices_owned,
                                                 payment_handler,
                                                 expected_encrypted_root,
+                                                progress_sink,
                                             )
                                             .await;
                                         match &result {
-                                            Ok(r) => eprintln!("[P2P-BUY] download completed: {} chunks, {}msat", r.chunks.len(), r.total_paid_msat),
+                                            Ok(r) => eprintln!("[P2P-BUY] download completed: {} chunks, {}msat", r.chunks_received, r.total_paid_msat),
                                             Err(e) => eprintln!("[P2P-BUY] download failed: {e:#}"),
                                         }
                                         let _ = download_tx.send(result);
                                     });
-                                    match download_rx.recv().unwrap_or_else(|_| {
-                                        eprintln!("[P2P-BUY] download channel dropped after {}ms", dl_start.elapsed().as_millis());
-                                        Err(anyhow::anyhow!("P2P download task dropped"))
-                                    }) {
-                                        Ok(result) => {
-                                            emitter.emit(
-                                                role,
-                                                "P2P_DOWNLOAD_COMPLETE",
-                                                serde_json::json!({
-                                                    "chunks": result.chunks.len(),
-                                                    "total_bytes": result.chunks.iter().map(|(_, d)| d.len()).sum::<usize>(),
-                                                    "message": "Chunks downloaded via P2P!",
-                                                }),
-                                            );
-                                            println!(
-                                                "P2P: downloaded {} chunks",
-                                                result.chunks.len()
-                                            );
-                                            let mut sorted = result.chunks;
-                                            sorted.sort_by_key(|(idx, _)| *idx);
-                                            let data: Vec<u8> =
-                                                sorted.into_iter().flat_map(|(_, d)| d).collect();
-                                            Some(data)
+                                    let recv_timeout = std::time::Duration::from_secs(
+                                        60 + (num_indices as u64) * 2
+                                    );
+                                    match download_rx.recv_timeout(recv_timeout) {
+                                        Ok(Ok(result)) => {
+                                            let reassembled = disk_sink.reassemble(result.chunks_received);
+                                            let _ = std::fs::remove_dir_all(&sink_dir);
+                                            match reassembled {
+                                                Ok(data) => {
+                                                    emitter.emit(
+                                                        role,
+                                                        "P2P_DOWNLOAD_COMPLETE",
+                                                        serde_json::json!({
+                                                            "chunks": result.chunks_received,
+                                                            "total_bytes": data.len(),
+                                                            "message": "Chunks downloaded via P2P!",
+                                                        }),
+                                                    );
+                                                    println!(
+                                                        "P2P: downloaded {} chunks ({} bytes)",
+                                                        result.chunks_received, data.len()
+                                                    );
+                                                    Some(data)
+                                                }
+                                                Err(e) => {
+                                                    eprintln!("[P2P-BUY] reassembly failed: {e}");
+                                                    None
+                                                }
+                                            }
                                         }
-                                        Err(e) => {
+                                        Ok(Err(e)) => {
+                                            let _ = std::fs::remove_dir_all(&sink_dir);
                                             emitter.emit(
                                                 role,
                                                 "P2P_DOWNLOAD_FAILED",
                                                 serde_json::json!({
                                                     "error": format!("{}", e),
-                                                    "message": "P2P download failed, falling back to HTTP.",
+                                                    "message": "P2P download failed.",
                                                 }),
                                             );
                                             println!(
-                                                "P2P: download failed ({}), falling back to HTTP",
+                                                "P2P: download failed ({})",
                                                 e
+                                            );
+                                            None
+                                        }
+                                        Err(_) => {
+                                            let _ = std::fs::remove_dir_all(&sink_dir);
+                                            let elapsed = dl_start.elapsed();
+                                            eprintln!("[P2P-BUY] download timed out after {:.1}s", elapsed.as_secs_f64());
+                                            emitter.emit(
+                                                role,
+                                                "P2P_DOWNLOAD_FAILED",
+                                                serde_json::json!({
+                                                    "error": format!("P2P download timed out after {:.0}s", elapsed.as_secs_f64()),
+                                                    "message": "P2P download timed out.",
+                                                }),
                                             );
                                             None
                                         }
