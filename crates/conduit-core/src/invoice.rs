@@ -72,6 +72,10 @@ pub struct LightningConfig {
     /// Channels with these peers become usable immediately without waiting
     /// for on-chain confirmations. Essential for test networks.
     pub trusted_peers_0conf: Vec<String>,
+    /// Public IP address for channel announcements (gossip).
+    /// When set, channels become public and discoverable, enabling multi-hop
+    /// routing through this node. Uses `listening_port` for the announced port.
+    pub public_ip: Option<String>,
 }
 
 impl Default for LightningConfig {
@@ -83,6 +87,7 @@ impl Default for LightningConfig {
             chain_source: ChainSource::Esplora("https://mempool.space/signet/api".into()),
             node_alias: None,
             trusted_peers_0conf: Vec::new(),
+            public_ip: None,
         }
     }
 }
@@ -178,6 +183,21 @@ pub fn start_node(config: &LightningConfig) -> Result<Node, InvoiceError> {
     builder
         .set_listening_addresses(vec![addr])
         .map_err(InvoiceError::Build)?;
+
+    if let Some(ref ip) = config.public_ip {
+        let ann_addr: SocketAddress = format!("{}:{}", ip, config.listening_port)
+            .parse()
+            .map_err(|_| {
+                InvoiceError::InvalidAddress(format!(
+                    "Could not parse announcement address {}:{}",
+                    ip, config.listening_port
+                ))
+            })?;
+        builder
+            .set_announcement_addresses(vec![ann_addr])
+            .map_err(InvoiceError::Build)?;
+        eprintln!("[ldk] announcement address: {}:{}", ip, config.listening_port);
+    }
 
     let node = builder.build()?;
     node.start()?;
@@ -663,6 +683,7 @@ mod tests {
             chain_source: ChainSource::Esplora("https://example.com/api".into()),
             node_alias: None,
             trusted_peers_0conf: Vec::new(),
+            public_ip: None,
         };
         assert_eq!(config.storage_dir, "/custom/path");
         assert_eq!(config.network, Network::Bitcoin);
@@ -686,6 +707,7 @@ mod tests {
             },
             node_alias: None,
             trusted_peers_0conf: Vec::new(),
+            public_ip: None,
         };
         assert_eq!(config.listening_port, 29735);
         assert!(

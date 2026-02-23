@@ -112,6 +112,7 @@ fn test_start_and_stop_node() {
         chain_source: test_chain_source(),
         node_alias: None,
         trusted_peers_0conf: Vec::new(),
+        public_ip: None,
     };
 
     eprintln!("Starting node with storage: {}", storage);
@@ -164,6 +165,7 @@ fn test_create_invoice_payment_hash() {
         chain_source: test_chain_source(),
         node_alias: None,
         trusted_peers_0conf: Vec::new(),
+        public_ip: None,
     };
 
     let node = invoice::start_node(&config).expect("node should start");
@@ -265,6 +267,7 @@ fn test_full_payment_cycle() {
         chain_source: chain_source.clone(),
         node_alias: None,
         trusted_peers_0conf: Vec::new(),
+        public_ip: None,
     };
     let buyer_config = LightningConfig {
         storage_dir: buyer_storage,
@@ -273,6 +276,7 @@ fn test_full_payment_cycle() {
         chain_source,
         node_alias: None,
         trusted_peers_0conf: Vec::new(),
+        public_ip: None,
     };
 
     eprintln!("Starting creator node...");
@@ -422,6 +426,7 @@ fn test_atomic_content_exchange() {
         chain_source: chain_source.clone(),
         node_alias: None,
         trusted_peers_0conf: Vec::new(),
+        public_ip: None,
     };
     let buyer_config = LightningConfig {
         storage_dir: buyer_storage,
@@ -430,6 +435,7 @@ fn test_atomic_content_exchange() {
         chain_source,
         node_alias: None,
         trusted_peers_0conf: Vec::new(),
+        public_ip: None,
     };
 
     // ── Creator: prepare content ──────────────────────────────────────────
