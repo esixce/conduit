@@ -145,6 +145,12 @@ impl ConsoleEmitter {
         self.log.clone()
     }
 
+    /// Returns a cloneable broadcast sender for emitting events from other
+    /// threads (e.g. P2P download progress callbacks that need `Send + 'static`).
+    pub fn sender(&self) -> broadcast::Sender<ConsoleEvent> {
+        self.tx.clone()
+    }
+
     pub fn emit(&self, role: &str, event_type: &str, data: serde_json::Value) {
         let mut event = ConsoleEvent {
             id: 0,

@@ -377,3 +377,282 @@ async fn wire_message_roundtrip() {
         _ => panic!("wrong variant"),
     }
 }
+
+// ── Phase 3A: Large file tests ──────────────────────────────────────────
+
+fn make_random_chunks(count: usize, chunk_size: usize) -> Vec<Vec<u8>> {
+    use rand::Rng;
+    let mut rng = rand::rng();
+    (0..count)
+        .map(|_| {
+            let mut buf = vec![0u8; chunk_size];
+            rng.fill(&mut buf[..]);
+            buf
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn large_file_download_500_chunks() {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let encrypted_hash = [0x10; 32];
+    let chunk_data = make_random_chunks(500, 1024);
+    let store = Arc::new(MockStore::new(encrypted_hash, chunk_data.clone()));
+
+    let seeder_ep = make_endpoint(vec![CONDUIT_ALPN.to_vec()]).await;
+    let handler = Arc::new(ChunkProtocol::new(store));
+    let router = Router::builder(seeder_ep.clone())
+        .accept(CONDUIT_ALPN, handler.as_ref().clone())
+        .spawn();
+
+    let seeder_addr = seeder_ep.addr();
+    let buyer_ep = make_endpoint(vec![]).await;
+    let client =
+        conduit_p2p::client::BuyerClient::new(buyer_ep.clone(), "large_500_ln".to_string());
+
+    let indices: Vec<u32> = (0..500).collect();
+    let result = client
+        .download(seeder_addr, encrypted_hash, &indices, Arc::new(MockPayment), None)
+        .await
+        .expect("500-chunk download should succeed");
+
+    assert_eq!(result.chunks.len(), 500);
+    assert_eq!(result.chunks_received, 500);
+
+    let mut by_index: HashMap<u32, Vec<u8>> = result.chunks.into_iter().collect();
+    for (i, original) in chunk_data.iter().enumerate() {
+        let downloaded = by_index.remove(&(i as u32)).unwrap();
+        assert_eq!(downloaded, *original, "chunk {} data mismatch", i);
+    }
+
+    buyer_ep.close().await;
+    router.shutdown().await.expect("router shutdown");
+}
+
+#[tokio::test]
+async fn large_file_download_1500_chunks() {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let encrypted_hash = [0x11; 32];
+    let chunk_data = make_random_chunks(1500, 256);
+    let store = Arc::new(MockStore::new(encrypted_hash, chunk_data.clone()));
+
+    let seeder_ep = make_endpoint(vec![CONDUIT_ALPN.to_vec()]).await;
+    let handler = Arc::new(ChunkProtocol::new(store));
+    let router = Router::builder(seeder_ep.clone())
+        .accept(CONDUIT_ALPN, handler.as_ref().clone())
+        .spawn();
+
+    let seeder_addr = seeder_ep.addr();
+    let buyer_ep = make_endpoint(vec![]).await;
+    let client =
+        conduit_p2p::client::BuyerClient::new(buyer_ep.clone(), "large_1500_ln".to_string());
+
+    let indices: Vec<u32> = (0..1500).collect();
+    let result = client
+        .download(seeder_addr, encrypted_hash, &indices, Arc::new(MockPayment), None)
+        .await
+        .expect("1500-chunk download should succeed");
+
+    assert_eq!(result.chunks.len(), 1500);
+    assert_eq!(result.chunks_received, 1500);
+
+    let mut by_index: HashMap<u32, Vec<u8>> = result.chunks.into_iter().collect();
+    for (i, original) in chunk_data.iter().enumerate() {
+        let downloaded = by_index.remove(&(i as u32)).unwrap();
+        assert_eq!(downloaded, *original, "chunk {} data mismatch", i);
+    }
+
+    buyer_ep.close().await;
+    router.shutdown().await.expect("router shutdown");
+}
+
+// ── Phase 3B: Concurrent buyers ─────────────────────────────────────────
+
+#[tokio::test]
+async fn concurrent_buyers_same_content() {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let encrypted_hash = [0x20; 32];
+    let chunk_data = make_random_chunks(50, 512);
+    let store = Arc::new(MockStore::new(encrypted_hash, chunk_data.clone()));
+
+    let seeder_ep = make_endpoint(vec![CONDUIT_ALPN.to_vec()]).await;
+    let handler = Arc::new(ChunkProtocol::new(store));
+    let router = Router::builder(seeder_ep.clone())
+        .accept(CONDUIT_ALPN, handler.as_ref().clone())
+        .spawn();
+    let seeder_addr = seeder_ep.addr();
+
+    let mut handles = Vec::new();
+    for buyer_id in 0..3u8 {
+        let addr = seeder_addr.clone();
+        let data = chunk_data.clone();
+        let handle = tokio::spawn(async move {
+            let ep = make_endpoint(vec![]).await;
+            let client = conduit_p2p::client::BuyerClient::new(
+                ep.clone(),
+                format!("concurrent_buyer_{buyer_id}"),
+            );
+            let indices: Vec<u32> = (0..50).collect();
+            let result = client
+                .download(addr, encrypted_hash, &indices, Arc::new(MockPayment), None)
+                .await
+                .unwrap_or_else(|e| panic!("buyer {buyer_id} download failed: {e}"));
+
+            assert_eq!(result.chunks.len(), 50, "buyer {buyer_id}");
+            let by_index: HashMap<u32, Vec<u8>> = result.chunks.into_iter().collect();
+            for (i, original) in data.iter().enumerate() {
+                assert_eq!(
+                    by_index[&(i as u32)],
+                    *original,
+                    "buyer {} chunk {} mismatch",
+                    buyer_id,
+                    i
+                );
+            }
+            ep.close().await;
+        });
+        handles.push(handle);
+    }
+
+    for h in handles {
+        h.await.expect("buyer task panicked");
+    }
+
+    router.shutdown().await.expect("router shutdown");
+}
+
+// ── Phase 3C: Timeout and failure recovery ──────────────────────────────
+
+#[derive(Debug)]
+struct SlowStore {
+    inner: MockStore,
+    delay_chunk: u32,
+}
+
+impl ChunkStore for SlowStore {
+    fn get_chunk(&self, hash: &[u8; 32], index: u32) -> Option<Vec<u8>> {
+        if index == self.delay_chunk {
+            std::thread::sleep(std::time::Duration::from_secs(65));
+        }
+        self.inner.get_chunk(hash, index)
+    }
+    fn get_proof(&self, hash: &[u8; 32], index: u32) -> Option<Vec<conduit_p2p::wire::ProofNode>> {
+        self.inner.get_proof(hash, index)
+    }
+    fn get_bitfield(&self, hash: &[u8; 32]) -> Option<Bitfield> {
+        self.inner.get_bitfield(hash)
+    }
+    fn create_invoice(
+        &self,
+        hash: &[u8; 32],
+        indices: &[u32],
+        buyer_ln: &str,
+    ) -> anyhow::Result<(String, u64)> {
+        self.inner.create_invoice(hash, indices, buyer_ln)
+    }
+    fn verify_payment(&self, hash: &[u8; 32], preimage: &[u8; 32]) -> bool {
+        self.inner.verify_payment(hash, preimage)
+    }
+}
+
+#[tokio::test]
+async fn chunk_timeout_triggers_error() {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let encrypted_hash = [0x30; 32];
+    let chunk_data: Vec<Vec<u8>> = vec![b"ok-chunk".to_vec(), b"slow-chunk".to_vec()];
+    let inner = MockStore::new(encrypted_hash, chunk_data);
+    let store = Arc::new(SlowStore {
+        inner,
+        delay_chunk: 1,
+    });
+
+    let seeder_ep = make_endpoint(vec![CONDUIT_ALPN.to_vec()]).await;
+    let handler = Arc::new(ChunkProtocol::new(store));
+    let router = Router::builder(seeder_ep.clone())
+        .accept(CONDUIT_ALPN, handler.as_ref().clone())
+        .spawn();
+
+    let seeder_addr = seeder_ep.addr();
+    let buyer_ep = make_endpoint(vec![]).await;
+    let client =
+        conduit_p2p::client::BuyerClient::new(buyer_ep.clone(), "timeout_test_ln".to_string());
+
+    let result = client
+        .download(
+            seeder_addr,
+            encrypted_hash,
+            &[0, 1],
+            Arc::new(MockPayment),
+            None,
+        )
+        .await;
+
+    assert!(result.is_err(), "should have timed out");
+    let err_msg = format!("{}", result.unwrap_err());
+    assert!(
+        err_msg.contains("timed out"),
+        "error should mention timeout, got: {err_msg}"
+    );
+
+    buyer_ep.close().await;
+    router.shutdown().await.expect("router shutdown");
+}
+
+// ── Phase 3D: Disk sink test ────────────────────────────────────────────
+
+#[tokio::test]
+async fn download_to_disk_sink() {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let encrypted_hash = [0x40; 32];
+    let chunk_data = make_random_chunks(200, 512);
+    let store = Arc::new(MockStore::new(encrypted_hash, chunk_data.clone()));
+
+    let seeder_ep = make_endpoint(vec![CONDUIT_ALPN.to_vec()]).await;
+    let handler = Arc::new(ChunkProtocol::new(store));
+    let router = Router::builder(seeder_ep.clone())
+        .accept(CONDUIT_ALPN, handler.as_ref().clone())
+        .spawn();
+
+    let seeder_addr = seeder_ep.addr();
+    let buyer_ep = make_endpoint(vec![]).await;
+    let client =
+        conduit_p2p::client::BuyerClient::new(buyer_ep.clone(), "disk_sink_ln".to_string());
+
+    let tmp_dir = std::env::temp_dir().join(format!("conduit-test-sink-{}", std::process::id()));
+    let sink =
+        std::sync::Arc::new(conduit_p2p::client::DiskSink::new(&tmp_dir).expect("create sink"));
+
+    let indices: Vec<u32> = (0..200).collect();
+    let result = client
+        .download_to_sink(
+            seeder_addr,
+            encrypted_hash,
+            &indices,
+            Arc::new(MockPayment),
+            None,
+            sink.clone(),
+        )
+        .await
+        .expect("disk sink download should succeed");
+
+    assert_eq!(result.chunks_received, 200);
+    assert!(result.chunks.is_empty(), "chunks should be empty when using sink");
+
+    let reassembled = sink.reassemble(200).expect("reassembly");
+    let expected: Vec<u8> = chunk_data.iter().flat_map(|c| c.iter().copied()).collect();
+    assert_eq!(reassembled, expected, "reassembled data should match original");
+
+    // Verify individual chunk files exist
+    for i in 0..200u32 {
+        assert!(sink.chunk_path(i).exists(), "chunk file {} should exist", i);
+    }
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    buyer_ep.close().await;
+    router.shutdown().await.expect("router shutdown");
+}

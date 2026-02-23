@@ -124,41 +124,92 @@ pub async fn chunk_data_handler(
 
 /// GET /api/chunks/{encrypted_hash}/proof/{index}
 /// Returns a Merkle inclusion proof for chunk i against the encrypted Merkle root.
+/// Uses the shared Merkle tree cache to avoid re-reading the entire file per request.
 pub async fn chunk_proof_handler(
     State(state): State<AppState>,
     AxumPath((encrypted_hash, index)): AxumPath<(String, usize)>,
 ) -> impl IntoResponse {
-    let result = find_entry_with_chunks(&state, &encrypted_hash);
-    match result {
-        Some((entry, enc_chunks, _cs)) => {
-            if index >= enc_chunks.len() {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({
-                        "error": "chunk index out of range"
-                    })),
-                )
-                    .into_response();
-            }
-            let tree = MerkleTree::from_chunks(&enc_chunks);
-            let proof = tree.proof(index);
-            let leaf_hash = hex::encode(tree.leaf_hash_at(index));
-            Json(serde_json::json!({
-                "index": index,
-                "leaf_hash": leaf_hash,
-                "proof": proof.to_json(),
-                "encrypted_root": entry.encrypted_root,
-            }))
-            .into_response()
+    let entry = {
+        let cat = state.catalog.lock().unwrap();
+        cat.iter()
+            .find(|e| e.encrypted_hash == encrypted_hash)
+            .cloned()
+    };
+    let entry = match entry {
+        Some(e) => e,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "content not found"})),
+            )
+                .into_response()
         }
-        None => (
+    };
+
+    let hash_bytes: Option<[u8; 32]> = hex::decode(&encrypted_hash).ok().and_then(|b| {
+        if b.len() == 32 {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&b);
+            Some(arr)
+        } else {
+            None
+        }
+    });
+
+    let tree = {
+        let hb = match hash_bytes {
+            Some(h) => h,
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "invalid encrypted_hash"})),
+                )
+                    .into_response()
+            }
+        };
+        let cached = {
+            let cache = state.merkle_cache.read().unwrap();
+            cache.get(&hb).cloned()
+        };
+        match cached {
+            Some(t) => t,
+            None => {
+                let result = find_entry_with_chunks(&state, &encrypted_hash);
+                match result {
+                    Some((_entry, enc_chunks, _cs)) => {
+                        let t = MerkleTree::from_chunks(&enc_chunks);
+                        let mut cache = state.merkle_cache.write().unwrap();
+                        cache.insert(hb, t.clone());
+                        t
+                    }
+                    None => {
+                        return (
+                            StatusCode::NOT_FOUND,
+                            Json(serde_json::json!({"error": "content not found"})),
+                        )
+                            .into_response()
+                    }
+                }
+            }
+        }
+    };
+
+    if index >= tree.leaf_count {
+        return (
             StatusCode::NOT_FOUND,
-            Json(serde_json::json!({
-                "error": "content not found"
-            })),
+            Json(serde_json::json!({"error": "chunk index out of range"})),
         )
-            .into_response(),
+            .into_response();
     }
+    let proof = tree.proof(index);
+    let leaf_hash = hex::encode(tree.leaf_hash_at(index));
+    Json(serde_json::json!({
+        "index": index,
+        "leaf_hash": leaf_hash,
+        "proof": proof.to_json(),
+        "encrypted_root": entry.encrypted_root,
+    }))
+    .into_response()
 }
 
 /// GET /api/chunks/{encrypted_hash}/bitfield

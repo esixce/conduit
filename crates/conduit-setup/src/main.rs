@@ -215,11 +215,19 @@ fn main() {
 
     let node_alias_value = cli.alias.clone().unwrap_or_default();
 
+    let trusted_peers: Vec<String> = cli
+        .trusted_peers
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
     let config = LightningConfig {
         storage_dir: cli.storage_dir,
         listening_port: cli.port,
         chain_source,
         node_alias: cli.alias.clone(),
+        trusted_peers_0conf: trusted_peers,
         ..LightningConfig::default()
     };
 
@@ -396,6 +404,7 @@ fn main() {
             ui_dist: cli.ui_dist.clone(),
             p2p_node: None,
             p2p_runtime_handle: None,
+            merkle_cache: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         };
 
         // Spawn P2P node if --p2p flag is set

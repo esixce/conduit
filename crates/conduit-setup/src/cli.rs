@@ -71,6 +71,12 @@ pub struct Cli {
     #[arg(long, env = "CONDUIT_P2P")]
     pub p2p: bool,
 
+    /// Comma-separated hex public keys of peers trusted for 0-conf channels.
+    /// Channels with these peers become usable immediately without waiting
+    /// for on-chain confirmations (typically 6 blocks = ~60 min on signet).
+    #[arg(long, env = "CONDUIT_TRUSTED_PEERS", value_delimiter = ',')]
+    pub trusted_peers: Vec<String>,
+
     #[command(subcommand)]
     pub command: Commands,
 }

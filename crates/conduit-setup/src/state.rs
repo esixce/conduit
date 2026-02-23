@@ -1,11 +1,19 @@
 use std::sync::Arc;
 
+use conduit_core::merkle::MerkleTree;
 use ed25519_dalek::SigningKey;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 use super::catalog::TrustedManufacturer;
 use super::events::{ConsoleEmitter, EventRouter};
+
+// ---------------------------------------------------------------------------
+// Shared Merkle tree cache (P2P + HTTP handlers)
+// ---------------------------------------------------------------------------
+
+pub type MerkleTreeCache =
+    Arc<std::sync::RwLock<std::collections::HashMap<[u8; 32], MerkleTree>>>;
 
 // ---------------------------------------------------------------------------
 // Registry push info (for publishing to the central registry)
@@ -59,6 +67,8 @@ pub struct AppState {
     // P2P (iroh)
     pub p2p_node: Option<Arc<conduit_p2p::node::P2pNode>>,
     pub p2p_runtime_handle: Option<tokio::runtime::Handle>,
+    // Shared Merkle tree cache (avoids re-reading entire files per proof)
+    pub merkle_cache: MerkleTreeCache,
 }
 
 // ---------------------------------------------------------------------------
