@@ -228,6 +228,7 @@ fn main() {
         chain_source,
         node_alias: cli.alias.clone(),
         trusted_peers_0conf: trusted_peers,
+        public_ip: cli.public_ip.clone(),
         ..LightningConfig::default()
     };
 
